@@ -26,6 +26,7 @@ except ImportError:
         import msvcrt
     except ImportError:
         msvcrt = None
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -1008,7 +1009,49 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+
+    # --- Reuse existing interactive session for continuity ---
+    _existing_session_id = None
+    if _session_db and origin:
+        _target_chat_id = str(origin.get("chat_id", ""))
+        _target_platform = origin.get("platform", "")
+        if _target_chat_id and _target_platform:
+            try:
+                _sessions_dir = get_hermes_home() / "sessions"
+                _meta_file = _sessions_dir / "sessions.json"
+                if _meta_file.exists():
+                    with open(_meta_file, "r") as _f:
+                        _meta = json.load(_f)
+                    _candidates = []
+                    for _sid, _m in _meta.items():
+                        _orig = _m.get("origin", {})
+                        if str(_orig.get("chat_id", "")) == _target_chat_id and \
+                           _orig.get("platform", "") == _target_platform:
+                            # Skip cron-only sessions
+                            if _sid.startswith("cron_"):
+                                continue
+                            _last = _m.get("last_updated", "")
+                            if _last:
+                                try:
+                                    _last_dt = datetime.fromisoformat(_last.replace("Z", "+00:00"))
+                                    _candidates.append((_last_dt, _sid))
+                                except Exception:
+                                    pass
+                    if _candidates:
+                        _candidates.sort(reverse=True)
+                        _existing_session_id = _candidates[0][1]
+                        logger.info(
+                            "Job '%s': reusing existing session %s for %s:%s",
+                            job_id, _existing_session_id, _target_platform, _target_chat_id,
+                        )
+            except Exception as e:
+                logger.debug("Job '%s': failed to look up existing session: %s", job_id, e)
+
+    if _existing_session_id:
+        _cron_session_id = _existing_session_id
+    else:
+        _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    # --- End reuse logic ---
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
