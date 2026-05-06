@@ -1008,6 +1008,26 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        # --- Ingest mode: store silently without invoking agent -----------
+        ingest_mode = request.headers.get("X-Hermes-Mode", "").strip().lower()
+        if ingest_mode == "ingest":
+            db = self._ensure_session_db()
+            if db is not None:
+                _ingest_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+                if not _ingest_session_id:
+                    _ingest_session_id = gateway_session_key or _derive_chat_session_id(system_prompt, "")
+                try:
+                    if db.get_session(_ingest_session_id) is None:
+                        db.create_session(_ingest_session_id, source="api_server:ingest")
+                except Exception:
+                    pass
+                for msg in conversation_messages:
+                    db.append_message(
+                        session_id=_ingest_session_id,
+                        role=msg["role"],
+                        content=msg["content"],
+                    )
+            return web.Response(status=204, headers={"X-Hermes-Session-Id": _ingest_session_id})
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.

@@ -5903,6 +5903,34 @@ class GatewayRunner:
 
         return message_text
 
+    def _load_ambient_context(
+        self,
+        session_key: str = "ambient:journal:context",
+        max_messages: int = 50,
+        since_hours: float = 24,
+    ) -> List[Dict[str, Any]]:
+        """Load recent ambient context entries from the ingest feed.
+
+        Queries the session DB for messages stored under ``session_key``
+        (typically by an external ingest client) and returns the most
+        recent ones within ``since_hours``.
+        """
+        db = getattr(self, "_session_db", None)
+        if db is None:
+            try:
+                from hermes_state import SessionDB
+                db = SessionDB()
+            except Exception:
+                return []
+        cutoff = time.time() - (since_hours * 3600)
+        try:
+            rows = db.get_messages(session_key)
+        except Exception:
+            return []
+        # get_messages returns ascending by timestamp; keep most recent
+        recent = [msg for msg in rows if msg.get("timestamp") is None or msg.get("timestamp") >= cutoff]
+        return recent[-max_messages:] if len(recent) > max_messages else recent
+
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
         pending_native = getattr(self, "_pending_native_image_paths_by_session", None)
         if not pending_native:
