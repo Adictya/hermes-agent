@@ -32,6 +32,11 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Any, List, Union
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
 # patches (tests/gateway/test_usage_command.py) target
@@ -41,6 +46,56 @@ from typing import Dict, Optional, Any, List, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from hermes_cli.config import cfg_get
+
+# --- Timezone helpers for sent-time context injection ----------------------
+
+def _configured_timezone(user_config: Optional[Dict[str, Any]] = None):
+    """Return configured ZoneInfo, or None if unset/invalid."""
+    tz_name = None
+    if isinstance(user_config, dict):
+        tz_name = user_config.get("timezone")
+    if not tz_name:
+        tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
+    if not isinstance(tz_name, str) or not tz_name.strip():
+        return None
+    try:
+        return ZoneInfo(tz_name.strip())
+    except Exception:
+        logger.warning("Invalid timezone '%s' for sent_at formatting; leaving timestamp as-is.", tz_name)
+        return None
+
+
+def _normalize_sent_at(value: Any, user_config: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Return a stable ISO-8601 timestamp string for source message times."""
+    if value is None:
+        return None
+    tz = _configured_timezone(user_config)
+    if isinstance(value, datetime):
+        dt = value.astimezone(tz) if tz and value.tzinfo else value.astimezone() if value.tzinfo else value
+        return dt.isoformat()
+    text = str(value).strip()
+    if not text:
+        return None
+    if tz:
+        try:
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is not None:
+                return dt.astimezone(tz).isoformat()
+        except Exception:
+            pass
+    return text
+
+
+def _inject_sent_at_prefix(content: Optional[str], sent_at: Any, user_config: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Prefix content with a source send-time note for LLM-visible context."""
+    sent_at_text = _normalize_sent_at(sent_at, user_config=user_config)
+    if not sent_at_text:
+        return content
+    body = content or ""
+    prefix = f"[Sent at: {sent_at_text}]\n\n"
+    if body.startswith(prefix):
+        return body
+    return prefix + body
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -5629,6 +5684,22 @@ class GatewayRunner:
                 if hasattr(self, "_busy_ack_ts"):
                     self._busy_ack_ts.pop(_quick_key, None)
 
+    def _is_timestamp_context_enabled(self, source: SessionSource, user_config: Optional[Dict[str, Any]] = None) -> bool:
+        """Return whether sent-time context should be injected for this source."""
+        if source.platform != Platform.TELEGRAM:
+            return False
+        user_config = user_config if user_config is not None else _load_gateway_config()
+        platform_cfg = user_config.get("telegram", {}) if isinstance(user_config, dict) else {}
+        if not isinstance(platform_cfg, dict):
+            return False
+        from gateway.platforms.base import resolve_channel_flag
+        return resolve_channel_flag(
+            platform_cfg,
+            "timestamp_context_chats",
+            str(source.thread_id) if source.thread_id else str(source.chat_id),
+            str(source.chat_id) if source.thread_id else None,
+        )
+
     async def _prepare_inbound_message_text(
         self,
         *,
@@ -5825,6 +5896,10 @@ class GatewayRunner:
                     message_text = _ctx_result.message
             except Exception as exc:
                 logger.debug("@ context reference expansion failed: %s", exc)
+
+        _ts_cfg = _load_gateway_config()
+        if self._is_timestamp_context_enabled(source, _ts_cfg):
+            message_text = _inject_sent_at_prefix(message_text, event.timestamp, user_config=_ts_cfg)
 
         return message_text
 
@@ -6397,6 +6472,14 @@ class GatewayRunner:
         if message_text is None:
             return
 
+        persist_user_message = message_text
+        persist_user_sent_at = None
+        if self._is_timestamp_context_enabled(source):
+            _sent_prefix = _inject_sent_at_prefix(None, event.timestamp, user_config=_load_gateway_config())
+            if _sent_prefix and isinstance(message_text, str) and message_text.startswith(_sent_prefix):
+                persist_user_message = message_text[len(_sent_prefix):].lstrip("\n")
+                persist_user_sent_at = _normalize_sent_at(event.timestamp, user_config=_load_gateway_config())
+
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.
@@ -6427,6 +6510,8 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                persist_user_message=persist_user_message,
+                persist_user_sent_at=persist_user_sent_at,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -6693,7 +6778,7 @@ class GatewayRunner:
                 # it's a gateway-generated hint, not model output. (#7100)
                 self.session_store.append_to_transcript(
                     session_entry.session_id,
-                    {"role": "user", "content": message_text, "timestamp": ts},
+                    {"role": "user", "content": persist_user_message, "timestamp": ts, "sent_at": persist_user_sent_at},
                 )
             else:
                 history_len = agent_result.get("history_offset", len(history))
@@ -6703,7 +6788,7 @@ class GatewayRunner:
                 if not new_messages:
                     self.session_store.append_to_transcript(
                         session_entry.session_id,
-                        {"role": "user", "content": message_text, "timestamp": ts}
+                        {"role": "user", "content": persist_user_message, "timestamp": ts, "sent_at": persist_user_sent_at}
                     )
                     if response:
                         self.session_store.append_to_transcript(
@@ -12704,6 +12789,8 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        persist_user_message: Optional[str] = None,
+        persist_user_sent_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -13515,6 +13602,8 @@ class GatewayRunner:
                         if msg.get("mirror"):
                             mirror_src = msg.get("mirror_source", "another session")
                             content = f"[Delivered from {mirror_src}] {content}"
+                        if self._is_timestamp_context_enabled(source, user_config) and msg.get("sent_at"):
+                            content = _inject_sent_at_prefix(content, msg.get("sent_at"), user_config=user_config)
                         entry = {"role": role, "content": content}
                         # Preserve reasoning fields on assistant messages so
                         # multi-turn reasoning context survives session reload.
@@ -13743,7 +13832,13 @@ class GatewayRunner:
                 else:
                     _run_message = message
 
-                result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
+                result = agent.run_conversation(
+                    _run_message,
+                    conversation_history=agent_history,
+                    task_id=session_id,
+                    persist_user_message=persist_user_message,
+                    persist_user_sent_at=persist_user_sent_at,
+                )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)

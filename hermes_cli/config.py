@@ -1094,6 +1094,7 @@ DEFAULT_CONFIG = {
     "telegram": {
         "reactions": False,            # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
+        "timestamp_context_chats": {}, # Per-chat/topic sent-time injection for LLM context (exact chat/topic IDs)
     },
 
     # Slack platform settings (gateway mode)

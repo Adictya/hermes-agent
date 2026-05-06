@@ -1326,6 +1326,7 @@ class AIAgent:
         # (e.g. CLI voice mode adds a temporary prefix for the live call only).
         self._persist_user_message_idx = None
         self._persist_user_message_override = None
+        self._persist_user_sent_at_override = None
 
         # Cache anthropic image-to-text fallbacks per image payload/URL so a
         # single tool loop does not repeatedly re-run auxiliary vision on the
@@ -3776,12 +3777,18 @@ class AIAgent:
         """
         idx = getattr(self, "_persist_user_message_idx", None)
         override = getattr(self, "_persist_user_message_override", None)
-        if override is None or idx is None:
+        sent_at_override = getattr(self, "_persist_user_sent_at_override", None)
+        if override is None and sent_at_override is None:
+            return
+        if idx is None:
             return
         if 0 <= idx < len(messages):
             msg = messages[idx]
             if isinstance(msg, dict) and msg.get("role") == "user":
-                msg["content"] = override
+                if override is not None:
+                    msg["content"] = override
+                if sent_at_override:
+                    msg["sent_at"] = sent_at_override
 
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
@@ -10574,6 +10581,7 @@ class AIAgent:
         task_id: str = None,
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
+        persist_user_sent_at: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run a complete conversation with tool calling until completion.
@@ -10589,6 +10597,8 @@ class AIAgent:
             persist_user_message: Optional clean user message to store in
                 transcripts/history when user_message contains API-only
                 synthetic prefixes.
+            persist_user_sent_at: Optional original source timestamp to store
+                alongside the persisted current-turn user message.
                     or queuing follow-up prefetch work.
 
         Returns:
@@ -10626,11 +10636,14 @@ class AIAgent:
             user_message = _sanitize_surrogates(user_message)
         if isinstance(persist_user_message, str):
             persist_user_message = _sanitize_surrogates(persist_user_message)
+        if isinstance(persist_user_sent_at, str):
+            persist_user_sent_at = _sanitize_surrogates(persist_user_sent_at)
 
         # Store stream callback for _interruptible_api_call to pick up
         self._stream_callback = stream_callback
         self._persist_user_message_idx = None
         self._persist_user_message_override = persist_user_message
+        self._persist_user_sent_at_override = persist_user_sent_at
         # Generate unique task_id if not provided to isolate VMs between concurrent tasks
         effective_task_id = task_id or str(uuid.uuid4())
         # Expose the active task_id so tools running mid-turn (e.g. delegate_task
