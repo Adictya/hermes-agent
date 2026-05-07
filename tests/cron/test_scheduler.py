@@ -717,6 +717,78 @@ class TestDeliverResultErrorReturns:
 
 
 class TestRunJobSessionPersistence:
+    def test_run_job_reuses_matching_gateway_session_history(self, tmp_path):
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir(parents=True)
+        session_id = "20260507_120000_abcd1234"
+        session_key = "agent:main:telegram:dm:123"
+        (sessions_dir / "sessions.json").write_text(
+            json.dumps(
+                {
+                    session_key: {
+                        "session_key": session_key,
+                        "session_id": session_id,
+                        "created_at": "2026-05-07T12:00:00",
+                        "updated_at": "2026-05-07T12:10:00",
+                        "origin": {"platform": "telegram", "chat_id": "123"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        history = [
+            {"role": "user", "content": "Earlier I mentioned journaling about sleep."},
+            {"role": "assistant", "content": "I noted that sleep is important."},
+        ]
+        fake_db = MagicMock()
+        fake_db.get_messages_as_conversation.return_value = history
+
+        job = {
+            "id": "journal-job",
+            "name": "Evening journal",
+            "prompt": "Check in on my journal.",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.session_id = session_id
+            mock_agent.run_conversation.return_value = {"final_response": "journal reply"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "journal reply"
+        assert job["_reused_chat_session"] is True
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["session_id"] == session_id
+        assert kwargs["platform"] == "cron"
+
+        call_kwargs = mock_agent.run_conversation.call_args.kwargs
+        assert call_kwargs["conversation_history"] == history
+        assert call_kwargs["persist_user_message"] == "[Scheduled job: Evening journal]\nCheck in on my journal."
+
+        fake_db.end_session.assert_not_called()
+        updated_meta = json.loads((sessions_dir / "sessions.json").read_text(encoding="utf-8"))
+        assert updated_meta[session_key]["session_id"] == session_id
+
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
             "id": "test-job",
@@ -760,6 +832,29 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
+
+    def test_reused_chat_delivery_is_not_wrapped(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "journal-job",
+                "name": "Evening journal",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+                "_reused_chat_session": True,
+            }
+            _deliver_result(job, "Natural journal reply.")
+
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content == "Natural journal reply."
+        assert "Cronjob Response" not in sent_content
 
     def test_run_job_closes_agent_on_failure_to_prevent_fd_leak(self, tmp_path):
         # Regression: if ``run_conversation`` raises, the ephemeral cron
