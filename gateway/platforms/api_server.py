@@ -1022,11 +1022,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
                 for msg in conversation_messages:
-                    db.append_message(
+                    message_id = db.append_message(
                         session_id=_ingest_session_id,
                         role=msg["role"],
                         content=msg["content"],
                     )
+                    try:
+                        from tools.ambient_context import analyze_ambient_message_images
+
+                        await analyze_ambient_message_images(message_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "Ambient ingest screenshot analysis failed for message %s: %s",
+                            message_id,
+                            exc,
+                        )
             return web.Response(status=204, headers={"X-Hermes-Session-Id": _ingest_session_id})
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.

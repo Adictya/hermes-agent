@@ -2,9 +2,9 @@
 """
 Ambient context tool.
 
-Reads screenshots from the ambient ingest session, analyzes them with vision AI,
-caches results so each image is only analyzed once, and returns activity
-descriptions.
+Reads screenshots from the ambient ingest session and returns cached activity
+descriptions. Ingest-time hooks analyze screenshots with vision AI when they are
+received so reads stay fast.
 """
 
 import base64
@@ -108,6 +108,34 @@ def _get_cached_analysis(image_hash: str) -> Optional[str]:
     return row[0] if row else None
 
 
+def _get_message_row(message_id: int) -> Optional[Dict[str, Any]]:
+    state_db = _state_db_path()
+    if not state_db.exists():
+        return None
+
+    conn = sqlite3.connect(str(state_db))
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, session_id, role, content, timestamp
+        FROM messages
+        WHERE id = ?
+        """,
+        (message_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "session_id": row[1],
+        "role": row[2],
+        "content": row[3],
+        "timestamp": row[4],
+    }
+
+
 def _store_analysis(
     image_hash: str,
     message_id: int,
@@ -169,9 +197,29 @@ def _extract_images_from_messages(
     images = []
     for row in rows:
         msg_id, _sess_id, role, content, timestamp = row
-        if not content:
-            continue
+        images.extend(
+            _extract_images_from_content(
+                message_id=msg_id,
+                role=role,
+                content=content,
+                timestamp=timestamp,
+            )
+        )
 
+    return images
+
+
+def _extract_images_from_content(
+    *,
+    message_id: int,
+    role: str,
+    content: Any,
+    timestamp: float,
+) -> List[Dict[str, Any]]:
+    if not content:
+        return []
+
+    if isinstance(content, str):
         try:
             raw = content
             if raw.startswith("\x00json:"):
@@ -183,46 +231,49 @@ def _extract_images_from_messages(
 
             data = json.loads(raw)
         except json.JSONDecodeError:
+            return []
+    else:
+        data = content
+
+    blocks = data if isinstance(data, list) else [data]
+    if isinstance(data, dict) and "content" in data:
+        blocks = data["content"]
+        if isinstance(blocks, str):
+            blocks = [{"type": "text", "text": blocks}]
+    elif isinstance(data, dict):
+        blocks = [data]
+
+    images = []
+    text_parts = []
+    for block in blocks:
+        if not isinstance(block, dict):
             continue
 
-        blocks = data if isinstance(data, list) else [data]
-        if isinstance(data, dict) and "content" in data:
-            blocks = data["content"]
-            if isinstance(blocks, str):
-                blocks = [{"type": "text", "text": blocks}]
-        elif isinstance(data, dict):
-            blocks = [data]
-
-        text_parts = []
-        for block in blocks:
-            if not isinstance(block, dict):
+        block_type = block.get("type", "")
+        if block_type == "text":
+            text_parts.append(block.get("text", ""))
+        elif block_type == "image_url":
+            url = block.get("image_url", {}).get("url", "")
+            if not url.startswith("data:image/"):
                 continue
 
-            block_type = block.get("type", "")
-            if block_type == "text":
-                text_parts.append(block.get("text", ""))
-            elif block_type == "image_url":
-                url = block.get("image_url", {}).get("url", "")
-                if not url.startswith("data:image/"):
-                    continue
-
-                try:
-                    header, image_data = url.split(",", 1)
-                    mime = header.split(";")[0].split(":")[1]
-                    image_hash = hashlib.sha256(image_data.encode()).hexdigest()
-                    images.append(
-                        {
-                            "message_id": msg_id,
-                            "timestamp": timestamp,
-                            "role": role,
-                            "content_text": "\n".join(text_parts).strip(),
-                            "image_data": image_data,
-                            "image_mime": mime,
-                            "image_hash": image_hash,
-                        }
-                    )
-                except Exception:
-                    logger.warning("Failed to parse data URL in message %s", msg_id)
+            try:
+                header, image_data = url.split(",", 1)
+                mime = header.split(";")[0].split(":")[1]
+                image_hash = hashlib.sha256(image_data.encode()).hexdigest()
+                images.append(
+                    {
+                        "message_id": message_id,
+                        "timestamp": timestamp,
+                        "role": role,
+                        "content_text": "\n".join(text_parts).strip(),
+                        "image_data": image_data,
+                        "image_mime": mime,
+                        "image_hash": image_hash,
+                    }
+                )
+            except Exception:
+                logger.warning("Failed to parse data URL in message %s", message_id)
 
     return images
 
@@ -267,6 +318,99 @@ async def _analyze_screenshot(
         return result_json
 
 
+async def _analyze_and_cache_image(
+    image: Dict[str, Any],
+    session_id: str,
+    *,
+    force: bool = False,
+) -> Dict[str, Any]:
+    cached = _get_cached_analysis(image["image_hash"])
+    if cached and not force:
+        return {
+            "message_id": image["message_id"],
+            "timestamp": image["timestamp"],
+            "analysis": cached,
+            "cached": True,
+        }
+
+    temp_path = None
+    try:
+        suffix = ".jpg"
+        if "png" in image["image_mime"]:
+            suffix = ".png"
+        elif "webp" in image["image_mime"]:
+            suffix = ".webp"
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+            temp_file.write(base64.b64decode(image["image_data"]))
+            temp_path = Path(temp_file.name)
+
+        analysis = await _analyze_screenshot(
+            temp_path,
+            image["timestamp"],
+            image["content_text"],
+        )
+
+        try:
+            vision_result = json.loads(analysis) if analysis.strip().startswith("{") else None
+        except Exception:
+            vision_result = None
+
+        if not (vision_result and not vision_result.get("success", True)):
+            _store_analysis(
+                image["image_hash"],
+                image["message_id"],
+                session_id,
+                image["timestamp"],
+                analysis,
+            )
+
+        return {
+            "message_id": image["message_id"],
+            "timestamp": image["timestamp"],
+            "analysis": analysis,
+            "cached": False,
+        }
+    except Exception as exc:
+        logger.error("Failed to analyze screenshot msg=%s: %s", image["message_id"], exc)
+        return {
+            "message_id": image["message_id"],
+            "timestamp": image["timestamp"],
+            "analysis": f"Error: {exc}",
+            "cached": False,
+            "error": True,
+        }
+    finally:
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+
+
+async def analyze_ambient_message_images(message_id: int) -> int:
+    """Analyze and cache screenshots for one persisted ambient ingest message."""
+    row = _get_message_row(message_id)
+    if not row:
+        return 0
+
+    _init_cache_db()
+    images = _extract_images_from_content(
+        message_id=row["id"],
+        role=row["role"],
+        content=row["content"],
+        timestamp=row["timestamp"],
+    )
+    analyzed = 0
+    for image in images:
+        if _get_cached_analysis(image["image_hash"]):
+            continue
+        result = await _analyze_and_cache_image(image, row["session_id"])
+        if not result.get("error"):
+            analyzed += 1
+    return analyzed
+
+
 async def read_ambient_context_tool(
     limit: int = 10,
     session_id: str = "ambient:journal:context",
@@ -274,7 +418,7 @@ async def read_ambient_context_tool(
     start_time: Any = None,
     end_time: Any = None,
 ) -> str:
-    """Read ambient screenshots from the ingest session and analyze uncached ones."""
+    """Read ambient screenshots from the ingest session and return cached analyses."""
     from tools.interrupt import is_interrupted
 
     if is_interrupted():
@@ -330,63 +474,18 @@ async def read_ambient_context_tool(
             )
             continue
 
-        temp_path = None
-        try:
-            suffix = ".jpg"
-            if "png" in image["image_mime"]:
-                suffix = ".png"
-            elif "webp" in image["image_mime"]:
-                suffix = ".webp"
-
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-                temp_file.write(base64.b64decode(image["image_data"]))
-                temp_path = Path(temp_file.name)
-
-            analysis = await _analyze_screenshot(
-                temp_path,
-                image["timestamp"],
-                image["content_text"],
-            )
-
-            try:
-                vision_result = json.loads(analysis) if analysis.strip().startswith("{") else None
-            except Exception:
-                vision_result = None
-
-            if not (vision_result and not vision_result.get("success", True)):
-                _store_analysis(
-                    image["image_hash"],
-                    image["message_id"],
-                    session_id,
-                    image["timestamp"],
-                    analysis,
-                )
-
+        if skip_cached:
+            results.append(await _analyze_and_cache_image(image, session_id, force=True))
+        else:
             results.append(
                 {
                     "message_id": image["message_id"],
                     "timestamp": image["timestamp"],
-                    "analysis": analysis,
+                    "analysis": "Analysis is not available yet. The ingest path analyzes screenshots when they are received.",
                     "cached": False,
+                    "pending": True,
                 }
             )
-        except Exception as exc:
-            logger.error("Failed to analyze screenshot msg=%s: %s", image["message_id"], exc)
-            results.append(
-                {
-                    "message_id": image["message_id"],
-                    "timestamp": image["timestamp"],
-                    "analysis": f"Error: {exc}",
-                    "cached": False,
-                    "error": True,
-                }
-            )
-        finally:
-            if temp_path and temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except Exception:
-                    pass
 
     results.sort(key=lambda item: item["timestamp"], reverse=True)
 
@@ -408,10 +507,10 @@ async def read_ambient_context_tool(
 READ_AMBIENT_CONTEXT_SCHEMA = {
     "name": "read_ambient_context",
     "description": (
-        "Read and analyze ambient screenshots from the background ingest session. "
-        "Returns activity descriptions for each screenshot. Images are analyzed "
-        "once and cached; subsequent calls return cached results unless skip_cached is set. "
-        "Use this to understand what the user was doing at specific points in time."
+        "Read cached analyses for ambient screenshots from the background ingest session. "
+        "Screenshots are analyzed when they are received, so normal reads avoid vision calls. "
+        "Use skip_cached only to force a re-analysis. Use this to understand what the user "
+        "was doing at specific points in time."
     ),
     "parameters": {
         "type": "object",
@@ -428,7 +527,7 @@ READ_AMBIENT_CONTEXT_SCHEMA = {
             },
             "skip_cached": {
                 "type": "boolean",
-                "description": "If true, re-analyze images even if a cached analysis exists.",
+                "description": "If true, force re-analysis even if a cached analysis exists.",
                 "default": False,
             },
             "start_time": {
