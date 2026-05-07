@@ -318,6 +318,46 @@ async def _analyze_screenshot(
         return result_json
 
 
+async def _analyze_image_payload(image: Dict[str, Any]) -> str:
+    temp_path = None
+    try:
+        suffix = ".jpg"
+        if "png" in image["image_mime"]:
+            suffix = ".png"
+        elif "webp" in image["image_mime"]:
+            suffix = ".webp"
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+            temp_file.write(base64.b64decode(image["image_data"]))
+            temp_path = Path(temp_file.name)
+
+        return await _analyze_screenshot(
+            temp_path,
+            image["timestamp"],
+            image["content_text"],
+        )
+    finally:
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception:
+                pass
+
+
+def _raise_if_failed_analysis(analysis: str) -> None:
+    try:
+        vision_result = json.loads(analysis) if analysis.strip().startswith("{") else None
+    except Exception:
+        vision_result = None
+
+    if vision_result and not vision_result.get("success", True):
+        raise RuntimeError(
+            vision_result.get("error")
+            or vision_result.get("analysis")
+            or "vision analysis failed"
+        )
+
+
 async def _analyze_and_cache_image(
     image: Dict[str, Any],
     session_id: str,
@@ -333,37 +373,16 @@ async def _analyze_and_cache_image(
             "cached": True,
         }
 
-    temp_path = None
     try:
-        suffix = ".jpg"
-        if "png" in image["image_mime"]:
-            suffix = ".png"
-        elif "webp" in image["image_mime"]:
-            suffix = ".webp"
-
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-            temp_file.write(base64.b64decode(image["image_data"]))
-            temp_path = Path(temp_file.name)
-
-        analysis = await _analyze_screenshot(
-            temp_path,
+        analysis = await _analyze_image_payload(image)
+        _raise_if_failed_analysis(analysis)
+        _store_analysis(
+            image["image_hash"],
+            image["message_id"],
+            session_id,
             image["timestamp"],
-            image["content_text"],
+            analysis,
         )
-
-        try:
-            vision_result = json.loads(analysis) if analysis.strip().startswith("{") else None
-        except Exception:
-            vision_result = None
-
-        if not (vision_result and not vision_result.get("success", True)):
-            _store_analysis(
-                image["image_hash"],
-                image["message_id"],
-                session_id,
-                image["timestamp"],
-                analysis,
-            )
 
         return {
             "message_id": image["message_id"],
@@ -380,12 +399,57 @@ async def _analyze_and_cache_image(
             "cached": False,
             "error": True,
         }
-    finally:
-        if temp_path and temp_path.exists():
-            try:
-                temp_path.unlink()
-            except Exception:
-                pass
+
+
+async def analyze_ambient_ingest_content(
+    *,
+    session_id: str,
+    role: str,
+    content: Any,
+    timestamp: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Analyze screenshots in an ingest message before the message is persisted.
+
+    Raises when vision analysis fails so callers can reject the ingest instead
+    of saving unanalyzed screenshots into state.db.
+    """
+    images = _extract_images_from_content(
+        message_id=0,
+        role=role,
+        content=content,
+        timestamp=timestamp if timestamp is not None else datetime.now(timezone.utc).timestamp(),
+    )
+    analyses = []
+    for image in images:
+        analysis = await _analyze_image_payload(image)
+        _raise_if_failed_analysis(analysis)
+        analyses.append(
+            {
+                "image_hash": image["image_hash"],
+                "session_id": session_id,
+                "timestamp": image["timestamp"],
+                "analysis": analysis,
+            }
+        )
+
+    return analyses
+
+
+def store_ambient_ingest_analyses(
+    *,
+    message_id: int,
+    session_id: str,
+    timestamp: float,
+    analyses: List[Dict[str, Any]],
+) -> None:
+    for item in analyses:
+        _store_analysis(
+            item["image_hash"],
+            message_id,
+            session_id,
+            timestamp,
+            item["analysis"],
+        )
 
 
 async def analyze_ambient_message_images(message_id: int) -> int:

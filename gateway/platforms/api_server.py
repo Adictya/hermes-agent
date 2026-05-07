@@ -1022,18 +1022,43 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
                 for msg in conversation_messages:
+                    try:
+                        from tools.ambient_context import (
+                            analyze_ambient_ingest_content,
+                            store_ambient_ingest_analyses,
+                        )
+
+                        analyzed_images = await analyze_ambient_ingest_content(
+                            session_id=_ingest_session_id,
+                            role=msg["role"],
+                            content=msg["content"],
+                            timestamp=time.time(),
+                        )
+                    except Exception as exc:
+                        logger.warning("Ambient ingest screenshot analysis failed: %s", exc)
+                        return web.json_response(
+                            _openai_error(f"Ambient screenshot analysis failed: {exc}"),
+                            status=502,
+                        )
+
                     message_id = db.append_message(
                         session_id=_ingest_session_id,
                         role=msg["role"],
                         content=msg["content"],
                     )
                     try:
-                        from tools.ambient_context import analyze_ambient_message_images
+                        from tools.ambient_context import _get_message_row
 
-                        await analyze_ambient_message_images(message_id)
+                        row = _get_message_row(message_id)
+                        store_ambient_ingest_analyses(
+                            message_id=message_id,
+                            session_id=_ingest_session_id,
+                            timestamp=(row or {}).get("timestamp", time.time()),
+                            analyses=analyzed_images,
+                        )
                     except Exception as exc:
                         logger.warning(
-                            "Ambient ingest screenshot analysis failed for message %s: %s",
+                            "Ambient ingest analysis cache store failed for message %s: %s",
                             message_id,
                             exc,
                         )
