@@ -5,9 +5,11 @@ import json
 import pytest
 
 from tools.ambient_context import (
+    AmbientAnalysisIncompleteError,
     AmbientIngestValidationError,
     _CONTENT_JSON_PREFIX,
     _analyze_screenshot,
+    _ambient_analysis_looks_incomplete,
     _extract_images_from_content,
 )
 
@@ -71,6 +73,14 @@ def test_extract_images_rejects_invalid_base64_for_ingest():
         )
 
 
+def test_ambient_analysis_incomplete_detector():
+    assert _ambient_analysis_looks_incomplete("Provider integrations")
+    assert _ambient_analysis_looks_incomplete("Short.")
+    assert not _ambient_analysis_looks_incomplete(
+        "Zen Browser is open on the Hermes dashboard. The page shows provider integrations."
+    )
+
+
 @pytest.mark.asyncio
 async def test_analyze_screenshot_rejects_vision_failure(monkeypatch, tmp_path):
     async def _fake_vision_analyze_tool(**kwargs):
@@ -100,4 +110,48 @@ async def test_analyze_screenshot_requires_non_empty_final_analysis(monkeypatch,
     image_path.write_bytes(b"not validated by patched vision tool")
 
     with pytest.raises(RuntimeError, match="no final content"):
+        await _analyze_screenshot(image_path, 1.0, "")
+
+
+@pytest.mark.asyncio
+async def test_analyze_screenshot_retries_incomplete_final_analysis(monkeypatch, tmp_path):
+    responses = iter(
+        [
+            {"success": True, "analysis": "Zen Browser is open displaying the Hermes dashboard. The page shows Provider integrations"},
+            {"success": True, "analysis": "Zen Browser is open displaying the Hermes dashboard. The page shows provider integrations and configuration controls."},
+        ]
+    )
+    prompts = []
+
+    async def _fake_vision_analyze_tool(**kwargs):
+        prompts.append(kwargs["user_prompt"])
+        return json.dumps(next(responses))
+
+    monkeypatch.setattr(
+        "tools.vision_tools.vision_analyze_tool",
+        _fake_vision_analyze_tool,
+    )
+    image_path = tmp_path / "screen.png"
+    image_path.write_bytes(b"not validated by patched vision tool")
+
+    analysis = await _analyze_screenshot(image_path, 1.0, "")
+
+    assert analysis.endswith("controls.")
+    assert len(prompts) == 2
+    assert "previous response was incomplete" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_analyze_screenshot_rejects_repeated_incomplete_analysis(monkeypatch, tmp_path):
+    async def _fake_vision_analyze_tool(**kwargs):
+        return json.dumps({"success": True, "analysis": "The page shows Provider integrations"})
+
+    monkeypatch.setattr(
+        "tools.vision_tools.vision_analyze_tool",
+        _fake_vision_analyze_tool,
+    )
+    image_path = tmp_path / "screen.png"
+    image_path.write_bytes(b"not validated by patched vision tool")
+
+    with pytest.raises(AmbientAnalysisIncompleteError):
         await _analyze_screenshot(image_path, 1.0, "")

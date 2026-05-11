@@ -30,6 +30,10 @@ class AmbientIngestValidationError(ValueError):
     """Raised when an ingest payload cannot be analyzed safely."""
 
 
+class AmbientAnalysisIncompleteError(RuntimeError):
+    """Raised when the vision model returns an obviously incomplete final answer."""
+
+
 def _state_db_path() -> Path:
     return get_hermes_home() / "state.db"
 
@@ -439,34 +443,18 @@ def _extract_images_from_content(
     return images
 
 
-async def _analyze_screenshot(
-    image_path: Path,
-    timestamp: float,
-    content_text: str,
-) -> str:
-    """Call the vision model with a prompt tuned for screenshot activity logging."""
+def _ambient_analysis_looks_incomplete(analysis: str) -> bool:
+    """Detect final-answer fragments that should not be persisted."""
+    text = analysis.strip()
+    if not text:
+        return True
+    if len(text) < 40:
+        return True
+    return text[-1] not in ".!?)]}'\""
+
+
+async def _call_vision_for_activity_log(image_path: Path, prompt: str) -> str:
     from tools.vision_tools import vision_analyze_tool
-
-    dt = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone()
-    time_str = dt.strftime("%Y-%m-%d %H:%M:%S %Z")
-
-    prompt = (
-        "This is a screenshot captured from Aditya's laptop. "
-        f"It was taken at {time_str}.\n\n"
-        "Your job is to produce a definitive, concise activity log entry describing "
-        "EXACTLY what Aditya was doing at that moment.\n\n"
-        "Instructions:\n"
-        "1. Identify the primary active application, window, browser tab, or game.\n"
-        "2. Note any visible code editors, IDEs, terminals, or file names.\n"
-        "3. If a browser is open, identify the website, page title, and any visible content.\n"
-        "4. Note any videos, streams, or media playing.\n"
-        "5. If chat or messaging apps are visible, note which ones.\n"
-        "6. Mention if this appears to be a dual-monitor setup or single screen.\n"
-        "7. Include visible text that clarifies the activity, such as an email subject, PR title, or error.\n"
-        "8. Be specific and factual; avoid assumptions about intent.\n\n"
-        "If the screen is mostly idle, such as desktop, wallpaper, or lock screen, state that clearly.\n\n"
-        f"Additional metadata sent with the screenshot:\n{content_text or '(none)'}"
-    )
 
     result_json = await vision_analyze_tool(
         image_url=str(image_path),
@@ -489,7 +477,51 @@ async def _analyze_screenshot(
     analysis = str(result.get("analysis") or "").strip()
     if not analysis:
         raise RuntimeError("Vision analysis returned no final content")
+    if _ambient_analysis_looks_incomplete(analysis):
+        raise AmbientAnalysisIncompleteError(
+            "Vision analysis returned an incomplete final content fragment"
+        )
     return analysis
+
+
+async def _analyze_screenshot(
+    image_path: Path,
+    timestamp: float,
+    content_text: str,
+) -> str:
+    """Call the vision model with a prompt tuned for screenshot activity logging."""
+    dt = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone()
+    time_str = dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    prompt = (
+        "This is a screenshot captured from Aditya's laptop. "
+        f"It was taken at {time_str}.\n\n"
+        "Your job is to produce a definitive, concise activity log entry describing "
+        "EXACTLY what Aditya was doing at that moment.\n\n"
+        "Instructions:\n"
+        "1. Identify the primary active application, window, browser tab, or game.\n"
+        "2. Note any visible code editors, IDEs, terminals, or file names.\n"
+        "3. If a browser is open, identify the website, page title, and any visible content.\n"
+        "4. Note any videos, streams, or media playing.\n"
+        "5. If chat or messaging apps are visible, note which ones.\n"
+        "6. Mention if this appears to be a dual-monitor setup or single screen.\n"
+        "7. Include visible text that clarifies the activity, such as an email subject, PR title, or error.\n"
+        "8. Be specific and factual; avoid assumptions about intent.\n\n"
+        "Write 2-4 complete sentences. End the final sentence with punctuation. "
+        "Return only the final activity log entry; do not return hidden reasoning or a partial fragment.\n\n"
+        "If the screen is mostly idle, such as desktop, wallpaper, or lock screen, state that clearly.\n\n"
+        f"Additional metadata sent with the screenshot:\n{content_text or '(none)'}"
+    )
+
+    try:
+        return await _call_vision_for_activity_log(image_path, prompt)
+    except AmbientAnalysisIncompleteError:
+        retry_prompt = (
+            f"{prompt}\n\n"
+            "The previous response was incomplete. Retry with a complete, self-contained "
+            "2-4 sentence activity log entry ending in punctuation."
+        )
+        return await _call_vision_for_activity_log(image_path, retry_prompt)
 
 
 async def _analyze_image_payload(image: Dict[str, Any]) -> str:
