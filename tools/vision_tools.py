@@ -46,6 +46,25 @@ logger = logging.getLogger(__name__)
 
 _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
 
+
+def _extract_final_content_only(response) -> str:
+    """Return assistant final content without falling back to reasoning traces."""
+    import re
+
+    msg = response.choices[0].message
+    content = (getattr(msg, "content", None) or "").strip()
+    if not content:
+        return ""
+
+    return re.sub(
+        r"<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>"
+        r".*?"
+        r"</(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>",
+        "",
+        content,
+        flags=re.DOTALL | re.IGNORECASE,
+    ).strip()
+
 # Configurable HTTP download timeout for _download_image().
 # Separate from auxiliary.vision.timeout which governs the LLM API call.
 # Resolution: config.yaml auxiliary.vision.download_timeout → env var → 30s default.
@@ -597,14 +616,18 @@ async def vision_analyze_tool(
             else:
                 raise
         
-        # Extract the analysis — fall back to reasoning if content is empty
-        analysis = extract_content_or_reasoning(response)
+        # Extract only final answer content. Reasoning traces are not suitable
+        # for persisted screenshot activity logs.
+        analysis = _extract_final_content_only(response)
 
         # Retry once on empty content (reasoning-only response)
         if not analysis:
             logger.warning("Vision LLM returned empty content, retrying once")
             response = await async_call_llm(**call_kwargs)
-            analysis = extract_content_or_reasoning(response)
+            analysis = _extract_final_content_only(response)
+
+        if not analysis:
+            raise ValueError("Vision LLM returned no final answer content")
 
         analysis_length = len(analysis)
         
@@ -1037,12 +1060,15 @@ async def video_analyze_tool(
             call_kwargs["model"] = model
 
         response = await async_call_llm(**call_kwargs)
-        analysis = extract_content_or_reasoning(response)
+        analysis = _extract_final_content_only(response)
 
         if not analysis:
             logger.warning("Empty video response, retrying once")
             response = await async_call_llm(**call_kwargs)
-            analysis = extract_content_or_reasoning(response)
+            analysis = _extract_final_content_only(response)
+
+        if not analysis:
+            raise ValueError("Video LLM returned no final answer content")
 
         analysis_length = len(analysis) if analysis else 0
         logger.info("Video analysis completed (%s characters)", analysis_length)
