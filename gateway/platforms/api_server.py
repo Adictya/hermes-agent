@@ -781,6 +781,126 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
 
+    async def _handle_ambient_ingest(
+        self,
+        request: "web.Request",
+        conversation_messages: List[Dict[str, Any]],
+        gateway_session_key: Optional[str],
+        param_prefix: str = "messages",
+    ) -> "web.Response":
+        """Analyze and persist ingest messages without invoking the agent."""
+        try:
+            from tools.ambient_context import (
+                AMBIENT_DEFAULT_SESSION_ID,
+                AmbientIngestValidationError,
+                analyze_ambient_ingest_content,
+                rollback_ambient_ingest_message,
+                store_ambient_ingest_analyses,
+                _get_message_row,
+            )
+        except Exception as exc:
+            logger.warning("Ambient ingest unavailable: %s", exc)
+            return web.json_response(
+                _openai_error(f"Ambient ingest unavailable: {exc}"),
+                status=503,
+            )
+
+        ingest_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if not ingest_session_id:
+            ingest_session_id = gateway_session_key or AMBIENT_DEFAULT_SESSION_ID
+        if re.search(r'[\r\n\x00]', ingest_session_id):
+            return web.json_response(
+                {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
+                status=400,
+            )
+        if len(ingest_session_id) > self._MAX_SESSION_HEADER_LEN:
+            return web.json_response(
+                {"error": {"message": "Session ID too long", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        db = self._ensure_session_db()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database is unavailable; ingest cannot persist messages"),
+                status=503,
+            )
+
+        try:
+            if db.get_session(ingest_session_id) is None:
+                db.create_session(ingest_session_id, source="api_server:ingest")
+        except Exception as exc:
+            logger.warning("Ambient ingest session setup failed: %s", exc)
+            return web.json_response(
+                _openai_error(f"Ambient ingest session setup failed: {exc}"),
+                status=500,
+            )
+
+        analyses_by_message = []
+        ingest_error_param = None
+        try:
+            for idx, msg in enumerate(conversation_messages):
+                ingest_error_param = f"{param_prefix}[{idx}].content"
+                analyses_by_message.append(
+                    await analyze_ambient_ingest_content(
+                        session_id=ingest_session_id,
+                        role=msg["role"],
+                        content=msg["content"],
+                        timestamp=time.time(),
+                    )
+                )
+        except AmbientIngestValidationError as exc:
+            logger.warning("Ambient ingest payload rejected: %s", exc)
+            return web.json_response(
+                _openai_error(
+                    str(exc),
+                    code="invalid_ambient_ingest",
+                    param=ingest_error_param,
+                ),
+                status=400,
+            )
+        except Exception as exc:
+            logger.warning("Ambient ingest screenshot analysis failed: %s", exc)
+            return web.json_response(
+                _openai_error(f"Ambient screenshot analysis failed: {exc}"),
+                status=502,
+            )
+
+        inserted_message_ids: List[int] = []
+        try:
+            for msg, analyzed_images in zip(conversation_messages, analyses_by_message):
+                message_id = db.append_message(
+                    session_id=ingest_session_id,
+                    role=msg["role"],
+                    content=msg["content"],
+                )
+                inserted_message_ids.append(message_id)
+
+                row = _get_message_row(message_id)
+                store_ambient_ingest_analyses(
+                    message_id=message_id,
+                    session_id=ingest_session_id,
+                    timestamp=(row or {}).get("timestamp", time.time()),
+                    analyses=analyzed_images,
+                )
+        except Exception as exc:
+            for message_id in reversed(inserted_message_ids):
+                try:
+                    rollback_ambient_ingest_message(message_id, ingest_session_id)
+                except Exception as rollback_exc:
+                    logger.warning(
+                        "Ambient ingest rollback failed for message %s: %s",
+                        message_id,
+                        rollback_exc,
+                    )
+            logger.warning("Ambient ingest persistence failed: %s", exc)
+            return web.json_response(
+                _openai_error(f"Ambient ingest persistence failed: {exc}"),
+                status=500,
+            )
+
+        return web.Response(status=204, headers={"X-Hermes-Session-Id": ingest_session_id})
+
     # ------------------------------------------------------------------
     # Agent creation helper
     # ------------------------------------------------------------------
@@ -1011,58 +1131,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # --- Ingest mode: store silently without invoking agent -----------
         ingest_mode = request.headers.get("X-Hermes-Mode", "").strip().lower()
         if ingest_mode == "ingest":
-            db = self._ensure_session_db()
-            if db is not None:
-                _ingest_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
-                if not _ingest_session_id:
-                    _ingest_session_id = gateway_session_key or _derive_chat_session_id(system_prompt, "")
-                try:
-                    if db.get_session(_ingest_session_id) is None:
-                        db.create_session(_ingest_session_id, source="api_server:ingest")
-                except Exception:
-                    pass
-                for msg in conversation_messages:
-                    try:
-                        from tools.ambient_context import (
-                            analyze_ambient_ingest_content,
-                            store_ambient_ingest_analyses,
-                        )
-
-                        analyzed_images = await analyze_ambient_ingest_content(
-                            session_id=_ingest_session_id,
-                            role=msg["role"],
-                            content=msg["content"],
-                            timestamp=time.time(),
-                        )
-                    except Exception as exc:
-                        logger.warning("Ambient ingest screenshot analysis failed: %s", exc)
-                        return web.json_response(
-                            _openai_error(f"Ambient screenshot analysis failed: {exc}"),
-                            status=502,
-                        )
-
-                    message_id = db.append_message(
-                        session_id=_ingest_session_id,
-                        role=msg["role"],
-                        content=msg["content"],
-                    )
-                    try:
-                        from tools.ambient_context import _get_message_row
-
-                        row = _get_message_row(message_id)
-                        store_ambient_ingest_analyses(
-                            message_id=message_id,
-                            session_id=_ingest_session_id,
-                            timestamp=(row or {}).get("timestamp", time.time()),
-                            analyses=analyzed_images,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Ambient ingest analysis cache store failed for message %s: %s",
-                            message_id,
-                            exc,
-                        )
-            return web.Response(status=204, headers={"X-Hermes-Session-Id": _ingest_session_id})
+            return await self._handle_ambient_ingest(
+                request,
+                conversation_messages,
+                gateway_session_key,
+            )
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -2074,6 +2147,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     input_messages.append({"role": role, "content": content})
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
+
+        ingest_mode = request.headers.get("X-Hermes-Mode", "").strip().lower()
+        if ingest_mode == "ingest":
+            if not any(_content_has_visible_payload(msg.get("content", "")) for msg in input_messages):
+                return web.json_response(_openai_error("No user message found in input"), status=400)
+            return await self._handle_ambient_ingest(
+                request,
+                input_messages,
+                gateway_session_key,
+                param_prefix="input",
+            )
 
         # Accept explicit conversation_history from the request body.
         # This lets stateless clients supply their own history instead of

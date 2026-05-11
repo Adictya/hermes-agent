@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Awaitable
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,6 +13,8 @@ import pytest
 
 from tools.vision_tools import (
     _validate_image_url,
+    _extract_final_content_only,
+    _final_answer_retry_kwargs,
     _handle_vision_analyze,
     _determine_mime_type,
     _image_to_base64_data_url,
@@ -115,6 +118,49 @@ class TestValidateImageUrl:
 
     def test_rejects_list(self):
         assert _validate_image_url(["https://example.com"]) is False
+
+
+# ---------------------------------------------------------------------------
+# Final-content extraction
+# ---------------------------------------------------------------------------
+
+
+class TestFinalContentExtraction:
+    def test_does_not_fall_back_to_reasoning_fields(self):
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        reasoning="hidden chain of thought",
+                        reasoning_content="hidden reasoning content",
+                        reasoning_details=[{"summary": "hidden summary"}],
+                    )
+                )
+            ]
+        )
+
+        assert _extract_final_content_only(response) == ""
+
+    def test_retry_kwargs_request_visible_final_answer_without_mutating_original(self):
+        call_kwargs = {
+            "task": "vision",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this screenshot."},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    ],
+                }
+            ],
+        }
+
+        retry = _final_answer_retry_kwargs(call_kwargs)
+
+        assert retry["extra_body"]["reasoning"] == {"enabled": False}
+        assert "hidden reasoning" in retry["messages"][0]["content"][0]["text"]
+        assert "hidden reasoning" not in call_kwargs["messages"][0]["content"][0]["text"]
 
 
 # ---------------------------------------------------------------------------

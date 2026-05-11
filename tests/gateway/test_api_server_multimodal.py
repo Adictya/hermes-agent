@@ -7,6 +7,8 @@ path (including the ``run_agent`` prologue that used to crash on list content)
 executes against a real aiohttp app.
 """
 
+import base64
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,6 +23,8 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from hermes_state import SessionDB
+from tools.ambient_context import AMBIENT_DEFAULT_SESSION_ID, read_ambient_context_tool
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +140,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+def _inline_data_image(payload: bytes = b"fake screenshot bytes") -> str:
+    return "data:image/png;base64," + base64.b64encode(payload).decode("ascii")
+
+
 @pytest.fixture
 def adapter():
     return _make_adapter()
@@ -221,6 +229,148 @@ class TestChatCompletionsMultimodalHTTP:
         assert body["error"]["code"] == "unsupported_content_type"
         assert body["error"]["param"] == "messages[0].content"
 
+
+class TestChatCompletionsAmbientIngestHTTP:
+    @pytest.mark.asyncio
+    async def test_ingest_defaults_to_ambient_session_and_caches_analysis(self, adapter, monkeypatch):
+        async def _fake_vision_analyze_tool(**kwargs):
+            return json.dumps({"success": True, "analysis": "Aditya is using Terminal."})
+
+        monkeypatch.setattr(
+            "tools.vision_tools.vision_analyze_tool",
+            _fake_vision_analyze_tool,
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                headers={"X-Hermes-Mode": "ingest"},
+                json={
+                    "model": "hermes-agent",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "screenshot"},
+                                {"type": "image_url", "image_url": {"url": _inline_data_image()}},
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status == 204, await resp.text()
+        assert resp.headers["X-Hermes-Session-Id"] == AMBIENT_DEFAULT_SESSION_ID
+
+        db = SessionDB()
+        messages = db.get_messages(AMBIENT_DEFAULT_SESSION_ID)
+        assert len(messages) == 1
+
+        ambient = json.loads(await read_ambient_context_tool())
+        assert ambient["count"] == 1
+        assert ambient["latest_analysis"] == "Aditya is using Terminal."
+        assert ambient["images"][0]["cached"] is True
+
+    @pytest.mark.asyncio
+    async def test_ingest_vision_failure_does_not_save_message(self, adapter, monkeypatch):
+        async def _fake_vision_analyze_tool(**kwargs):
+            return json.dumps({"success": False, "error": "no final content"})
+
+        monkeypatch.setattr(
+            "tools.vision_tools.vision_analyze_tool",
+            _fake_vision_analyze_tool,
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                headers={"X-Hermes-Mode": "ingest"},
+                json={
+                    "model": "hermes-agent",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": _inline_data_image()}},
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status == 502
+        db = SessionDB()
+        assert db.get_messages(AMBIENT_DEFAULT_SESSION_ID) == []
+
+    @pytest.mark.asyncio
+    async def test_ingest_cache_failure_rolls_back_message(self, adapter, monkeypatch):
+        async def _fake_vision_analyze_tool(**kwargs):
+            return json.dumps({"success": True, "analysis": "Visible analysis"})
+
+        def _fail_store(**kwargs):
+            raise RuntimeError("cache unavailable")
+
+        monkeypatch.setattr(
+            "tools.vision_tools.vision_analyze_tool",
+            _fake_vision_analyze_tool,
+        )
+        monkeypatch.setattr(
+            "tools.ambient_context.store_ambient_ingest_analyses",
+            _fail_store,
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                headers={"X-Hermes-Mode": "ingest"},
+                json={
+                    "model": "hermes-agent",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": _inline_data_image()}},
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status == 500
+        db = SessionDB()
+        assert db.get_messages(AMBIENT_DEFAULT_SESSION_ID) == []
+
+    @pytest.mark.asyncio
+    async def test_ingest_rejects_remote_image_urls(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                headers={"X-Hermes-Mode": "ingest"},
+                json={
+                    "model": "hermes-agent",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": "https://example.com/screenshot.png"},
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status == 400
+        body = await resp.json()
+        assert body["error"]["code"] == "invalid_ambient_ingest"
+        assert body["error"]["param"] == "messages[0].content"
+
     @pytest.mark.asyncio
     async def test_non_image_data_url_returns_400(self, adapter):
         app = _create_app(adapter)
@@ -248,6 +398,39 @@ class TestChatCompletionsMultimodalHTTP:
 
 
 class TestResponsesMultimodalHTTP:
+    @pytest.mark.asyncio
+    async def test_responses_ingest_uses_same_ambient_pipeline(self, adapter, monkeypatch):
+        async def _fake_vision_analyze_tool(**kwargs):
+            return json.dumps({"success": True, "analysis": "Responses ingest analysis"})
+
+        monkeypatch.setattr(
+            "tools.vision_tools.vision_analyze_tool",
+            _fake_vision_analyze_tool,
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/responses",
+                headers={"X-Hermes-Mode": "ingest"},
+                json={
+                    "model": "hermes-agent",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "Describe."},
+                                {"type": "input_image", "image_url": _inline_data_image()},
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        assert resp.status == 204, await resp.text()
+        ambient = json.loads(await read_ambient_context_tool())
+        assert ambient["latest_analysis"] == "Responses ingest analysis"
+
     @pytest.mark.asyncio
     async def test_input_image_canonicalized_and_forwarded(self, adapter):
         app = _create_app(adapter)
