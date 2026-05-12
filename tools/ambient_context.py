@@ -2,9 +2,9 @@
 """
 Ambient context tool.
 
-Reads screenshots from the ambient ingest session and returns cached activity
-descriptions. Ingest-time hooks analyze screenshots with vision AI when they are
-received so reads stay fast.
+Reads persisted activity descriptions from the ambient ingest session.
+Ingest-time hooks analyze screenshots with vision AI, store only the resulting
+description, and discard the source image before reads happen.
 """
 
 import base64
@@ -32,10 +32,6 @@ class AmbientIngestValidationError(ValueError):
 
 class AmbientAnalysisIncompleteError(RuntimeError):
     """Raised when the vision model returns an obviously incomplete final answer."""
-
-
-def _state_db_path() -> Path:
-    return get_hermes_home() / "state.db"
 
 
 def _cache_db_path() -> Path:
@@ -98,6 +94,11 @@ def _init_cache_db() -> None:
         if "image_index" not in columns:
             cursor.execute("ALTER TABLE image_analyses RENAME TO image_analyses_legacy")
             table_exists = False
+        else:
+            if "source_role" not in columns:
+                cursor.execute("ALTER TABLE image_analyses ADD COLUMN source_role TEXT")
+            if "content_text" not in columns:
+                cursor.execute("ALTER TABLE image_analyses ADD COLUMN content_text TEXT")
 
     if not table_exists:
         cursor.execute(
@@ -108,6 +109,8 @@ def _init_cache_db() -> None:
                 image_hash TEXT NOT NULL,
                 session_id TEXT,
                 timestamp REAL,
+                source_role TEXT,
+                content_text TEXT,
                 analysis TEXT NOT NULL,
                 analyzed_at REAL DEFAULT (unixepoch()),
                 PRIMARY KEY (message_id, image_index)
@@ -125,18 +128,41 @@ def _init_cache_db() -> None:
             cursor.execute("PRAGMA table_info(image_analyses_legacy)")
             legacy_columns = {row[1] for row in cursor.fetchall()}
             if {"image_hash", "analysis"}.issubset(legacy_columns):
-                analyzed_at_expr = (
-                    "analyzed_at" if "analyzed_at" in legacy_columns else "unixepoch()"
-                )
+                message_expr = "message_id" if "message_id" in legacy_columns else "NULL"
+                session_expr = "session_id" if "session_id" in legacy_columns else "NULL"
+                timestamp_expr = "timestamp" if "timestamp" in legacy_columns else "unixepoch()"
+                analyzed_at_expr = "analyzed_at" if "analyzed_at" in legacy_columns else "unixepoch()"
                 cursor.execute(
                     f"""
-                    INSERT OR IGNORE INTO image_analyses
-                    (message_id, image_index, image_hash, session_id, timestamp, analysis, analyzed_at)
-                    SELECT COALESCE(message_id, 0), 0, image_hash, session_id,
-                           timestamp, analysis, COALESCE({analyzed_at_expr}, unixepoch())
+                    SELECT rowid, {message_expr}, image_hash, {session_expr},
+                           {timestamp_expr}, analysis, {analyzed_at_expr}
                     FROM image_analyses_legacy
                     """
                 )
+                legacy_rows = cursor.fetchall()
+                used_keys = set()
+                cursor.execute("SELECT COALESCE(MAX(message_id), 0) FROM image_analyses")
+                next_id = int(cursor.fetchone()[0] or 0) + 1
+                for row in legacy_rows:
+                    rowid, legacy_message_id, image_hash, session_id, timestamp, analysis, analyzed_at = row
+                    event_id = legacy_message_id or rowid or next_id
+                    try:
+                        event_id = int(event_id)
+                    except (TypeError, ValueError):
+                        event_id = next_id
+                    while (event_id, 0) in used_keys:
+                        event_id = next_id
+                        next_id += 1
+                    used_keys.add((event_id, 0))
+                    next_id = max(next_id, event_id + 1)
+                    cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO image_analyses
+                        (message_id, image_index, image_hash, session_id, timestamp, analysis, analyzed_at)
+                        VALUES (?, 0, ?, ?, ?, ?, COALESCE(?, unixepoch()))
+                        """,
+                        (event_id, image_hash, session_id, timestamp, analysis, analyzed_at),
+                    )
             cursor.execute("DROP TABLE image_analyses_legacy")
 
     cursor.execute(
@@ -155,157 +181,64 @@ def _init_cache_db() -> None:
     conn.close()
 
 
-def _get_cached_analysis(
-    image_hash: str,
-    message_id: Optional[int] = None,
-    image_index: int = 0,
+def store_ambient_ingest_events(
     *,
-    allow_hash_fallback: bool = False,
-) -> Optional[str]:
-    db = _cache_db_path()
-    if not db.exists():
-        return None
-
-    _init_cache_db()
-    conn = sqlite3.connect(str(db))
-    cursor = conn.cursor()
-
-    if message_id is not None:
-        cursor.execute(
-            """
-            SELECT analysis FROM image_analyses
-            WHERE message_id = ? AND image_index = ?
-            """,
-            (message_id, image_index),
-        )
-        row = cursor.fetchone()
-        if row:
-            conn.close()
-            return row[0]
-
-    if not allow_hash_fallback:
-        conn.close()
-        return None
-
-    cursor.execute(
-        """
-        SELECT analysis FROM image_analyses
-        WHERE image_hash = ?
-        ORDER BY timestamp DESC, analyzed_at DESC
-        LIMIT 1
-        """,
-        (image_hash,),
-    )
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
-def _get_message_row(message_id: int) -> Optional[Dict[str, Any]]:
-    state_db = _state_db_path()
-    if not state_db.exists():
-        return None
-
-    conn = sqlite3.connect(str(state_db))
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        SELECT id, session_id, role, content, timestamp
-        FROM messages
-        WHERE id = ?
-        """,
-        (message_id,),
-    )
-    row = cursor.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {
-        "id": row[0],
-        "session_id": row[1],
-        "role": row[2],
-        "content": row[3],
-        "timestamp": row[4],
-    }
-
-
-def _store_analysis(
-    image_hash: str,
-    message_id: int,
     session_id: str,
-    timestamp: float,
-    analysis: str,
-    image_index: int = 0,
-) -> None:
+    analyses: List[Dict[str, Any]],
+) -> List[int]:
+    """Persist analyzed ambient events without retaining source images."""
+    if not analyses:
+        return []
+
     _init_cache_db()
     conn = sqlite3.connect(str(_cache_db_path()))
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO image_analyses
-        (message_id, image_index, image_hash, session_id, timestamp, analysis)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (message_id, image_index, image_hash, session_id, timestamp, analysis),
-    )
-    conn.commit()
-    conn.close()
+    inserted_ids: List[int] = []
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("SELECT COALESCE(MAX(message_id), 0) FROM image_analyses")
+        next_id = int(cursor.fetchone()[0] or 0) + 1
+        for item in analyses:
+            event_id = next_id
+            next_id += 1
+            cursor.execute(
+                """
+                INSERT INTO image_analyses
+                (message_id, image_index, image_hash, session_id, timestamp,
+                 source_role, content_text, analysis)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    item.get("image_index", 0),
+                    item["image_hash"],
+                    item.get("session_id") or session_id,
+                    item["timestamp"],
+                    item.get("role"),
+                    item.get("content_text"),
+                    item["analysis"],
+                ),
+            )
+            inserted_ids.append(event_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return inserted_ids
 
 
-def delete_ambient_ingest_analyses(message_id: int) -> None:
-    """Remove cached analyses for a message after a compensated ingest rollback."""
-    db = _cache_db_path()
-    if not db.exists():
-        return
-
-    _init_cache_db()
-    conn = sqlite3.connect(str(db))
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM image_analyses WHERE message_id = ?", (message_id,))
-    conn.commit()
-    conn.close()
-
-
-def rollback_ambient_ingest_message(message_id: int, session_id: str) -> None:
-    """Best-effort removal of an ingest message whose cache write failed."""
-    delete_ambient_ingest_analyses(message_id)
-
-    state_db = _state_db_path()
-    if not state_db.exists():
-        return
-
-    conn = sqlite3.connect(str(state_db), timeout=5.0)
-    cursor = conn.cursor()
-    cursor.execute(
-        "DELETE FROM messages WHERE id = ? AND session_id = ?",
-        (message_id, session_id),
-    )
-    if cursor.rowcount:
-        cursor.execute(
-            """
-            UPDATE sessions
-            SET message_count = CASE WHEN message_count > 0 THEN message_count - 1 ELSE 0 END
-            WHERE id = ?
-            """,
-            (session_id,),
-        )
-    conn.commit()
-    conn.close()
-
-
-def _extract_images_from_messages(
+def _get_ambient_analysis_events(
     limit: int = 20,
     session_id: str = AMBIENT_DEFAULT_SESSION_ID,
     start_timestamp: Optional[float] = None,
     end_timestamp: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """Return screenshot content blocks from the given persisted session."""
-    state_db = _state_db_path()
-    if not state_db.exists():
-        return []
-
-    where_clauses = ["session_id = ?"]
-    params: List[Any] = [session_id]
+    """Return persisted ambient analysis rows from ambient_context.db."""
+    _init_cache_db()
+    where_clauses = ["(session_id = ? OR (? = ? AND (session_id IS NULL OR session_id = '')))"]
+    params: List[Any] = [session_id, session_id, AMBIENT_DEFAULT_SESSION_ID]
     if start_timestamp is not None:
         where_clauses.append("timestamp >= ?")
         params.append(start_timestamp)
@@ -314,14 +247,15 @@ def _extract_images_from_messages(
         params.append(end_timestamp)
     params.append(limit)
 
-    conn = sqlite3.connect(str(state_db))
+    conn = sqlite3.connect(str(_cache_db_path()))
     cursor = conn.cursor()
     cursor.execute(
         f"""
-        SELECT id, session_id, role, content, timestamp
-        FROM messages
+        SELECT message_id, image_index, image_hash, session_id, timestamp,
+               source_role, content_text, analysis, analyzed_at
+        FROM image_analyses
         WHERE {' AND '.join(where_clauses)}
-        ORDER BY timestamp DESC
+        ORDER BY timestamp DESC, analyzed_at DESC
         LIMIT ?
         """,
         params,
@@ -329,19 +263,21 @@ def _extract_images_from_messages(
     rows = cursor.fetchall()
     conn.close()
 
-    images = []
-    for row in rows:
-        msg_id, _sess_id, role, content, timestamp = row
-        images.extend(
-            _extract_images_from_content(
-                message_id=msg_id,
-                role=role,
-                content=content,
-                timestamp=timestamp,
-            )
-        )
-
-    return images
+    return [
+        {
+            "message_id": row[0],
+            "event_id": row[0],
+            "image_index": row[1],
+            "image_hash": row[2],
+            "session_id": row[3] or session_id,
+            "timestamp": row[4],
+            "role": row[5],
+            "content_text": row[6] or "",
+            "analysis": row[7],
+            "analyzed_at": row[8],
+        }
+        for row in rows
+    ]
 
 
 def _extract_images_from_content(
@@ -550,70 +486,6 @@ async def _analyze_image_payload(image: Dict[str, Any]) -> str:
                 pass
 
 
-def _raise_if_failed_analysis(analysis: str) -> None:
-    try:
-        vision_result = json.loads(analysis) if analysis.strip().startswith("{") else None
-    except Exception:
-        vision_result = None
-
-    if vision_result and not vision_result.get("success", True):
-        raise RuntimeError(
-            vision_result.get("error")
-            or vision_result.get("analysis")
-            or "vision analysis failed"
-        )
-
-
-async def _analyze_and_cache_image(
-    image: Dict[str, Any],
-    session_id: str,
-    *,
-    force: bool = False,
-) -> Dict[str, Any]:
-    cached = _get_cached_analysis(
-        image["image_hash"],
-        image.get("message_id"),
-        image.get("image_index", 0),
-    )
-    if cached and not force:
-        return {
-            "message_id": image["message_id"],
-            "image_index": image.get("image_index", 0),
-            "timestamp": image["timestamp"],
-            "analysis": cached,
-            "cached": True,
-        }
-
-    try:
-        analysis = await _analyze_image_payload(image)
-        _store_analysis(
-            image["image_hash"],
-            image["message_id"],
-            session_id,
-            image["timestamp"],
-            analysis,
-            image.get("image_index", 0),
-        )
-
-        return {
-            "message_id": image["message_id"],
-            "image_index": image.get("image_index", 0),
-            "timestamp": image["timestamp"],
-            "analysis": analysis,
-            "cached": False,
-        }
-    except Exception as exc:
-        logger.error("Failed to analyze screenshot msg=%s: %s", image["message_id"], exc)
-        return {
-            "message_id": image["message_id"],
-            "image_index": image.get("image_index", 0),
-            "timestamp": image["timestamp"],
-            "analysis": f"Error: {exc}",
-            "cached": False,
-            "error": True,
-        }
-
-
 async def analyze_ambient_ingest_content(
     *,
     session_id: str,
@@ -621,10 +493,10 @@ async def analyze_ambient_ingest_content(
     content: Any,
     timestamp: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """Analyze screenshots in an ingest message before the message is persisted.
+    """Analyze screenshots in an ingest message before any durable write.
 
     Raises when vision analysis fails so callers can reject the ingest instead
-    of saving unanalyzed screenshots into state.db.
+    of storing partial or unanalyzed ambient events.
     """
     images = _extract_images_from_content(
         message_id=0,
@@ -642,6 +514,8 @@ async def analyze_ambient_ingest_content(
                 "image_index": image.get("image_index", 0),
                 "session_id": session_id,
                 "timestamp": image["timestamp"],
+                "role": image.get("role"),
+                "content_text": image.get("content_text", ""),
                 "analysis": analysis,
             }
         )
@@ -649,59 +523,13 @@ async def analyze_ambient_ingest_content(
     return analyses
 
 
-def store_ambient_ingest_analyses(
-    *,
-    message_id: int,
-    session_id: str,
-    timestamp: float,
-    analyses: List[Dict[str, Any]],
-) -> None:
-    for item in analyses:
-        _store_analysis(
-            item["image_hash"],
-            message_id,
-            session_id,
-            timestamp,
-            item["analysis"],
-            item.get("image_index", 0),
-        )
-
-
-async def analyze_ambient_message_images(message_id: int) -> int:
-    """Analyze and cache screenshots for one persisted ambient ingest message."""
-    row = _get_message_row(message_id)
-    if not row:
-        return 0
-
-    _init_cache_db()
-    images = _extract_images_from_content(
-        message_id=row["id"],
-        role=row["role"],
-        content=row["content"],
-        timestamp=row["timestamp"],
-    )
-    analyzed = 0
-    for image in images:
-        if _get_cached_analysis(
-            image["image_hash"],
-            image["message_id"],
-            image.get("image_index", 0),
-        ):
-            continue
-        result = await _analyze_and_cache_image(image, row["session_id"])
-        if not result.get("error"):
-            analyzed += 1
-    return analyzed
-
-
 async def read_ambient_context_tool(
     limit: int = 10,
     session_id: str = AMBIENT_DEFAULT_SESSION_ID,
-    skip_cached: bool = False,
     start_time: Any = None,
     end_time: Any = None,
 ) -> str:
-    """Read ambient screenshots from the ingest session and return cached analyses."""
+    """Read persisted ambient screenshot analyses without touching image data."""
     from tools.interrupt import is_interrupted
 
     if is_interrupted():
@@ -720,15 +548,13 @@ async def read_ambient_context_tool(
     ):
         return tool_error("start_time must be less than or equal to end_time", success=False)
 
-    _init_cache_db()
-
-    images = _extract_images_from_messages(
+    results = _get_ambient_analysis_events(
         limit=limit,
         session_id=session_id,
         start_timestamp=start_timestamp,
         end_timestamp=end_timestamp,
     )
-    if not images:
+    if not results:
         return json.dumps(
             {
                 "success": True,
@@ -742,39 +568,6 @@ async def read_ambient_context_tool(
             indent=2,
             ensure_ascii=False,
         )
-
-    results = []
-    for image in images:
-        cached = _get_cached_analysis(
-            image["image_hash"],
-            image["message_id"],
-            image.get("image_index", 0),
-        )
-        if cached and not skip_cached:
-            results.append(
-                {
-                    "message_id": image["message_id"],
-                    "image_index": image.get("image_index", 0),
-                    "timestamp": image["timestamp"],
-                    "analysis": cached,
-                    "cached": True,
-                }
-            )
-            continue
-
-        if skip_cached:
-            results.append(await _analyze_and_cache_image(image, session_id, force=True))
-        else:
-            results.append(
-                {
-                    "message_id": image["message_id"],
-                    "image_index": image.get("image_index", 0),
-                    "timestamp": image["timestamp"],
-                    "analysis": "Analysis is not available yet. The ingest path analyzes screenshots when they are received.",
-                    "cached": False,
-                    "pending": True,
-                }
-            )
 
     results.sort(key=lambda item: item["timestamp"], reverse=True)
 
@@ -796,9 +589,9 @@ async def read_ambient_context_tool(
 READ_AMBIENT_CONTEXT_SCHEMA = {
     "name": "read_ambient_context",
     "description": (
-        "Read cached analyses for ambient screenshots from the background ingest session. "
-        "Screenshots are analyzed when they are received, so normal reads avoid vision calls. "
-        "Use skip_cached only to force a re-analysis. Use this to understand what the user "
+        "Read persisted ambient screenshot descriptions from the background ingest session. "
+        "Screenshots are analyzed when they are received, and the source image is discarded; "
+        "this tool only retrieves stored descriptions. Use this to understand what the user "
         "was doing at specific points in time."
     ),
     "parameters": {
@@ -806,18 +599,13 @@ READ_AMBIENT_CONTEXT_SCHEMA = {
         "properties": {
             "limit": {
                 "type": "integer",
-                "description": "Maximum number of recent messages to scan for screenshots (default 10).",
+                "description": "Maximum number of recent ambient descriptions to return (default 10).",
                 "default": 10,
             },
             "session_id": {
                 "type": "string",
                 "description": "The ambient ingest session ID to read from (default ambient:journal:context).",
                 "default": AMBIENT_DEFAULT_SESSION_ID,
-            },
-            "skip_cached": {
-                "type": "boolean",
-                "description": "If true, force re-analysis even if a cached analysis exists.",
-                "default": False,
             },
             "start_time": {
                 "anyOf": [{"type": "number"}, {"type": "string"}],
@@ -843,7 +631,6 @@ def _handle_read_ambient_context(args: Dict[str, Any], **kw: Any) -> Awaitable[s
     return read_ambient_context_tool(
         limit=args.get("limit", 10),
         session_id=args.get("session_id", AMBIENT_DEFAULT_SESSION_ID),
-        skip_cached=args.get("skip_cached", False),
         start_time=args.get("start_time"),
         end_time=args.get("end_time"),
     )

@@ -23,7 +23,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
-from hermes_state import SessionDB
+from hermes_constants import get_hermes_home
 from tools.ambient_context import AMBIENT_DEFAULT_SESSION_ID, read_ambient_context_tool
 
 
@@ -234,7 +234,7 @@ class TestChatCompletionsAmbientIngestHTTP:
     @pytest.mark.asyncio
     async def test_ingest_defaults_to_ambient_session_and_caches_analysis(self, adapter, monkeypatch):
         async def _fake_vision_analyze_tool(**kwargs):
-            return json.dumps({"success": True, "analysis": "Aditya is using Terminal."})
+            return json.dumps({"success": True, "analysis": "Aditya is using Terminal to review the ambient screenshot pipeline."})
 
         monkeypatch.setattr(
             "tools.vision_tools.vision_analyze_tool",
@@ -263,14 +263,11 @@ class TestChatCompletionsAmbientIngestHTTP:
         assert resp.status == 204, await resp.text()
         assert resp.headers["X-Hermes-Session-Id"] == AMBIENT_DEFAULT_SESSION_ID
 
-        db = SessionDB()
-        messages = db.get_messages(AMBIENT_DEFAULT_SESSION_ID)
-        assert len(messages) == 1
-
         ambient = json.loads(await read_ambient_context_tool())
         assert ambient["count"] == 1
-        assert ambient["latest_analysis"] == "Aditya is using Terminal."
-        assert ambient["images"][0]["cached"] is True
+        assert ambient["latest_analysis"] == "Aditya is using Terminal to review the ambient screenshot pipeline."
+        assert "cached" not in ambient["images"][0]
+        assert not (get_hermes_home() / "state.db").exists()
 
     @pytest.mark.asyncio
     async def test_ingest_vision_failure_does_not_save_message(self, adapter, monkeypatch):
@@ -301,13 +298,13 @@ class TestChatCompletionsAmbientIngestHTTP:
             )
 
         assert resp.status == 502
-        db = SessionDB()
-        assert db.get_messages(AMBIENT_DEFAULT_SESSION_ID) == []
+        ambient = json.loads(await read_ambient_context_tool())
+        assert ambient["count"] == 0
 
     @pytest.mark.asyncio
-    async def test_ingest_cache_failure_rolls_back_message(self, adapter, monkeypatch):
+    async def test_ingest_cache_failure_does_not_store_event(self, adapter, monkeypatch):
         async def _fake_vision_analyze_tool(**kwargs):
-            return json.dumps({"success": True, "analysis": "Visible analysis"})
+            return json.dumps({"success": True, "analysis": "The screenshot shows a terminal workflow with visible analysis content."})
 
         def _fail_store(**kwargs):
             raise RuntimeError("cache unavailable")
@@ -316,10 +313,7 @@ class TestChatCompletionsAmbientIngestHTTP:
             "tools.vision_tools.vision_analyze_tool",
             _fake_vision_analyze_tool,
         )
-        monkeypatch.setattr(
-            "tools.ambient_context.store_ambient_ingest_analyses",
-            _fail_store,
-        )
+        monkeypatch.setattr("tools.ambient_context.store_ambient_ingest_events", _fail_store)
 
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -340,8 +334,8 @@ class TestChatCompletionsAmbientIngestHTTP:
             )
 
         assert resp.status == 500
-        db = SessionDB()
-        assert db.get_messages(AMBIENT_DEFAULT_SESSION_ID) == []
+        ambient = json.loads(await read_ambient_context_tool())
+        assert ambient["count"] == 0
 
     @pytest.mark.asyncio
     async def test_ingest_rejects_remote_image_urls(self, adapter):
@@ -401,7 +395,7 @@ class TestResponsesMultimodalHTTP:
     @pytest.mark.asyncio
     async def test_responses_ingest_uses_same_ambient_pipeline(self, adapter, monkeypatch):
         async def _fake_vision_analyze_tool(**kwargs):
-            return json.dumps({"success": True, "analysis": "Responses ingest analysis"})
+            return json.dumps({"success": True, "analysis": "Responses ingest stores a terminal screenshot description without retaining the image."})
 
         monkeypatch.setattr(
             "tools.vision_tools.vision_analyze_tool",
@@ -429,7 +423,7 @@ class TestResponsesMultimodalHTTP:
 
         assert resp.status == 204, await resp.text()
         ambient = json.loads(await read_ambient_context_tool())
-        assert ambient["latest_analysis"] == "Responses ingest analysis"
+        assert ambient["latest_analysis"] == "Responses ingest stores a terminal screenshot description without retaining the image."
 
     @pytest.mark.asyncio
     async def test_input_image_canonicalized_and_forwarded(self, adapter):

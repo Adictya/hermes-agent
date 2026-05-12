@@ -7,10 +7,13 @@ import pytest
 from tools.ambient_context import (
     AmbientAnalysisIncompleteError,
     AmbientIngestValidationError,
+    AMBIENT_DEFAULT_SESSION_ID,
     _CONTENT_JSON_PREFIX,
     _analyze_screenshot,
     _ambient_analysis_looks_incomplete,
     _extract_images_from_content,
+    read_ambient_context_tool,
+    store_ambient_ingest_events,
 )
 
 
@@ -79,6 +82,60 @@ def test_ambient_analysis_incomplete_detector():
     assert not _ambient_analysis_looks_incomplete(
         "Zen Browser is open on the Hermes dashboard. The page shows provider integrations."
     )
+
+
+@pytest.mark.asyncio
+async def test_read_ambient_context_reads_stored_descriptions_without_state_db():
+    store_ambient_ingest_events(
+        session_id=AMBIENT_DEFAULT_SESSION_ID,
+        analyses=[
+            {
+                "image_hash": "hash-1",
+                "image_index": 0,
+                "session_id": AMBIENT_DEFAULT_SESSION_ID,
+                "timestamp": 10.0,
+                "role": "user",
+                "content_text": "metadata",
+                "analysis": "The user is working in a terminal.",
+            }
+        ],
+    )
+
+    result = json.loads(await read_ambient_context_tool())
+
+    assert result["count"] == 1
+    assert result["latest_analysis"] == "The user is working in a terminal."
+    assert result["images"][0]["event_id"] == result["images"][0]["message_id"]
+    assert result["images"][0]["content_text"] == "metadata"
+    assert "cached" not in result["images"][0]
+
+
+@pytest.mark.asyncio
+async def test_read_ambient_context_does_not_reanalyze(monkeypatch):
+    async def _fail_if_called(**kwargs):
+        raise AssertionError("read_ambient_context must not call vision")
+
+    monkeypatch.setattr("tools.vision_tools.vision_analyze_tool", _fail_if_called)
+    store_ambient_ingest_events(
+        session_id=AMBIENT_DEFAULT_SESSION_ID,
+        analyses=[
+            {
+                "image_hash": "hash-2",
+                "image_index": 0,
+                "session_id": AMBIENT_DEFAULT_SESSION_ID,
+                "timestamp": 11.0,
+                "role": "user",
+                "content_text": "",
+                "analysis": "The user is reading a dashboard.",
+            }
+        ],
+    )
+
+    result = json.loads(await read_ambient_context_tool())
+
+    assert result["count"] == 1
+    assert result["latest_analysis"] == "The user is reading a dashboard."
+    assert "skip_cached_ignored" not in result
 
 
 @pytest.mark.asyncio

@@ -804,9 +804,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 AMBIENT_DEFAULT_SESSION_ID,
                 AmbientIngestValidationError,
                 analyze_ambient_ingest_content,
-                rollback_ambient_ingest_message,
-                store_ambient_ingest_analyses,
-                _get_message_row,
+                store_ambient_ingest_events,
             )
         except Exception as exc:
             logger.warning("Ambient ingest unavailable: %s", exc)
@@ -829,29 +827,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        db = self._ensure_session_db()
-        if db is None:
-            return web.json_response(
-                _openai_error("Session database is unavailable; ingest cannot persist messages"),
-                status=503,
-            )
-
-        try:
-            if db.get_session(ingest_session_id) is None:
-                db.create_session(ingest_session_id, source="api_server:ingest")
-        except Exception as exc:
-            logger.warning("Ambient ingest session setup failed: %s", exc)
-            return web.json_response(
-                _openai_error(f"Ambient ingest session setup failed: {exc}"),
-                status=500,
-            )
-
-        analyses_by_message = []
+        analyses = []
         ingest_error_param = None
         try:
             for idx, msg in enumerate(conversation_messages):
                 ingest_error_param = f"{param_prefix}[{idx}].content"
-                analyses_by_message.append(
+                analyses.extend(
                     await analyze_ambient_ingest_content(
                         session_id=ingest_session_id,
                         role=msg["role"],
@@ -876,33 +857,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=502,
             )
 
-        inserted_message_ids: List[int] = []
         try:
-            for msg, analyzed_images in zip(conversation_messages, analyses_by_message):
-                message_id = db.append_message(
-                    session_id=ingest_session_id,
-                    role=msg["role"],
-                    content=msg["content"],
-                )
-                inserted_message_ids.append(message_id)
-
-                row = _get_message_row(message_id)
-                store_ambient_ingest_analyses(
-                    message_id=message_id,
-                    session_id=ingest_session_id,
-                    timestamp=(row or {}).get("timestamp", time.time()),
-                    analyses=analyzed_images,
-                )
+            store_ambient_ingest_events(
+                session_id=ingest_session_id,
+                analyses=analyses,
+            )
         except Exception as exc:
-            for message_id in reversed(inserted_message_ids):
-                try:
-                    rollback_ambient_ingest_message(message_id, ingest_session_id)
-                except Exception as rollback_exc:
-                    logger.warning(
-                        "Ambient ingest rollback failed for message %s: %s",
-                        message_id,
-                        rollback_exc,
-                    )
             logger.warning("Ambient ingest persistence failed: %s", exc)
             return web.json_response(
                 _openai_error(f"Ambient ingest persistence failed: {exc}"),
