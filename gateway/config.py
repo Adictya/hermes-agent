@@ -807,6 +807,18 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = {str(k): v for k, v in channel_prompts.items()}
                     else:
                         bridged["channel_prompts"] = channel_prompts
+                if "timestamp_context_chats" in platform_cfg:
+                    timestamp_context_chats = platform_cfg["timestamp_context_chats"]
+                    if isinstance(timestamp_context_chats, dict):
+                        bridged["timestamp_context_chats"] = {
+                            str(k): v for k, v in timestamp_context_chats.items()
+                        }
+                    elif isinstance(timestamp_context_chats, list):
+                        bridged["timestamp_context_chats"] = [
+                            str(v) for v in timestamp_context_chats
+                        ]
+                    else:
+                        bridged["timestamp_context_chats"] = timestamp_context_chats
                 enabled_was_explicit = "enabled" in platform_cfg
                 if not bridged and not enabled_was_explicit:
                     continue

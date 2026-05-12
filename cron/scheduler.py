@@ -27,8 +27,9 @@ except ImportError:
         import msvcrt
     except ImportError:
         msvcrt = None
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -425,6 +426,135 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
     return targets[0] if targets else None
 
 
+def _normalize_target_thread_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _target_matches_origin(target: dict, origin: dict) -> bool:
+    """Return True when a persisted gateway origin maps to a cron delivery target."""
+    if not isinstance(target, dict) or not isinstance(origin, dict):
+        return False
+    if str(origin.get("platform", "")).lower() != str(target.get("platform", "")).lower():
+        return False
+    if str(origin.get("chat_id", "")) != str(target.get("chat_id", "")):
+        return False
+    return _normalize_target_thread_id(origin.get("thread_id")) == _normalize_target_thread_id(target.get("thread_id"))
+
+
+def _parse_session_updated_at(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _find_recent_chat_session_for_target(target: Optional[dict]) -> Optional[Dict[str, Any]]:
+    """Find the most recent non-cron gateway session for a delivery target."""
+    if not target:
+        return None
+
+    meta_file = _get_hermes_home() / "sessions" / "sessions.json"
+    if not meta_file.exists():
+        return None
+
+    try:
+        with open(meta_file, "r", encoding="utf-8") as fh:
+            meta = json.load(fh) or {}
+    except Exception as exc:
+        logger.debug("Failed to read gateway session index for cron continuity: %s", exc)
+        return None
+
+    candidates: list[tuple[datetime, str, dict]] = []
+    for session_key, entry in meta.items():
+        if not isinstance(entry, dict):
+            continue
+        session_id = str(entry.get("session_id") or "")
+        if not session_id or session_id.startswith("cron_"):
+            continue
+        if _target_matches_origin(target, entry.get("origin") or {}):
+            updated = _parse_session_updated_at(entry.get("updated_at") or entry.get("last_updated"))
+            if updated is not None:
+                candidates.append((updated, session_key, entry))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _, session_key, entry = candidates[0]
+    return {"session_key": session_key, "entry": entry, "session_id": str(entry.get("session_id") or "")}
+
+
+def _load_cron_continuity_history(session_db, session_id: str) -> List[Dict[str, Any]]:
+    """Load prior chat transcript for a cron run that continues a gateway session."""
+    db_messages: List[Dict[str, Any]] = []
+    if session_db:
+        try:
+            db_messages = session_db.get_messages_as_conversation(session_id)
+        except Exception as exc:
+            logger.debug("Cron continuity: failed to load SQLite transcript for %s: %s", session_id, exc)
+
+    jsonl_messages: List[Dict[str, Any]] = []
+    transcript_path = _get_hermes_home() / "sessions" / f"{session_id}.jsonl"
+    if transcript_path.exists():
+        try:
+            with open(transcript_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        jsonl_messages.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        logger.warning("Cron continuity: skipping corrupt transcript row in %s", transcript_path)
+        except Exception as exc:
+            logger.debug("Cron continuity: failed to load JSONL transcript for %s: %s", session_id, exc)
+
+    return jsonl_messages if len(jsonl_messages) > len(db_messages) else db_messages
+
+
+def _touch_gateway_session_entry(session_key: Optional[str], session_id: str) -> None:
+    """Best-effort update of sessions.json after a cron run appends to a chat session."""
+    if not session_key:
+        return
+    meta_file = _get_hermes_home() / "sessions" / "sessions.json"
+    if not meta_file.exists():
+        return
+    try:
+        with open(meta_file, "r", encoding="utf-8") as fh:
+            meta = json.load(fh) or {}
+        entry = meta.get(session_key)
+        if not isinstance(entry, dict):
+            return
+        now_iso = _hermes_now().isoformat()
+        entry["session_id"] = session_id
+        entry["updated_at"] = now_iso
+        # Older builds used last_updated; update it only when already present.
+        if "last_updated" in entry:
+            entry["last_updated"] = now_iso
+        tmp = meta_file.with_suffix(meta_file.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, indent=2, ensure_ascii=False)
+        os.replace(tmp, meta_file)
+    except Exception as exc:
+        logger.debug("Cron continuity: failed to update gateway session index: %s", exc)
+
+
+def _scheduled_job_persisted_user_message(job: dict) -> str:
+    name = str(job.get("name") or job.get("id") or "scheduled job")
+    prompt = str(job.get("prompt") or "").strip()
+    skills = [str(s).strip() for s in (job.get("skills") or []) if str(s).strip()]
+    parts = [f"[Scheduled job: {name}]"]
+    if skills:
+        parts.append(f"Skills: {', '.join(skills)}")
+    if prompt:
+        parts.append(prompt)
+    return "\n".join(parts)
+
+
 # Media extension sets — audio routing is centralized in gateway.platforms.base
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
@@ -509,6 +639,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
     except Exception:
         pass
+
+    if job.get("_reused_chat_session"):
+        wrap_response = False
 
     if wrap_response:
         task_name = job.get("name", job["id"])
@@ -1190,7 +1323,41 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+
+    # Load delivery env before resolving targets so home-channel cron jobs can
+    # continue the chat they deliver into, not just jobs with an explicit origin.
+    try:
+        from dotenv import load_dotenv as _early_load_dotenv
+        try:
+            _early_load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="utf-8")
+        except UnicodeDecodeError:
+            _early_load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="latin-1")
+    except Exception:
+        pass
+
+    delivery_target = _resolve_delivery_target(job)
+    _continuity = _find_recent_chat_session_for_target(delivery_target)
+    _continuity_session_key = _continuity.get("session_key") if _continuity else None
+    _continuity_history: List[Dict[str, Any]] = []
+    _reused_chat_session = False
+
+    if _continuity and _continuity.get("session_id"):
+        _cron_session_id = _continuity["session_id"]
+        _continuity_history = _load_cron_continuity_history(_session_db, _cron_session_id)
+        _reused_chat_session = True
+        job["_reused_chat_session"] = True
+        logger.info(
+            "Job '%s': continuing gateway session %s for %s:%s thread=%s with %d prior messages",
+            job_id,
+            _cron_session_id,
+            delivery_target.get("platform") if delivery_target else "?",
+            delivery_target.get("chat_id") if delivery_target else "?",
+            delivery_target.get("thread_id") if delivery_target else None,
+            len(_continuity_history),
+        )
+    else:
+        _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+        job.pop("_reused_chat_session", None)
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -1273,7 +1440,6 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         except UnicodeDecodeError:
             load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="latin-1")
 
-        delivery_target = _resolve_delivery_target(job)
         if delivery_target:
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
@@ -1482,7 +1648,18 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        _run_kwargs = {}
+        if _reused_chat_session:
+            _run_kwargs = {
+                "conversation_history": _continuity_history or None,
+                "persist_user_message": _scheduled_job_persisted_user_message(job),
+            }
+        _cron_future = _cron_pool.submit(
+            _cron_context.run,
+            agent.run_conversation,
+            prompt,
+            **_run_kwargs,
+        )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -1565,6 +1742,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             raise RuntimeError(_err_text)
 
         final_response = result.get("final_response", "") or ""
+        if _reused_chat_session and agent is not None:
+            _effective_session_id = getattr(agent, "session_id", _cron_session_id) or _cron_session_id
+            _touch_gateway_session_entry(_continuity_session_key, _effective_session_id)
+            _cron_session_id = _effective_session_id
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
@@ -1627,7 +1808,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             _VAR_MAP[_var_name].set("")
         if _session_db:
             try:
-                _session_db.end_session(_cron_session_id, "cron_complete")
+                if not _reused_chat_session:
+                    _session_db.end_session(_cron_session_id, "cron_complete")
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
             try:

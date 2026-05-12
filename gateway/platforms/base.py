@@ -1256,6 +1256,63 @@ def resolve_channel_skills(
     return None
 
 
+def resolve_channel_flag(
+    config_extra: dict,
+    key: str,
+    channel_id: str,
+    parent_id: str | None = None,
+) -> bool:
+    """Resolve a per-channel boolean flag from platform config.
+
+    Looks up *key* in the adapter's ``config.extra`` dict.
+    Prefers an exact match on *channel_id*; falls back to *parent_id*
+    (useful for forum threads / child channels inheriting a parent flag).
+
+    Config values may be:
+    - dict: {channel_id: bool}
+    - list: [channel_id, ...] (presence means True)
+    - bool: global value
+    - str: "true" or "false" (case-insensitive)
+
+    Returns True if the flag is explicitly enabled for the channel.
+    """
+    value = config_extra.get(key)
+    if value is None:
+        return False
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, dict):
+        for cid in (channel_id, parent_id):
+            if not cid:
+                continue
+            v = value.get(str(cid))
+            if v is not None:
+                if isinstance(v, bool):
+                    return v
+                if isinstance(v, str):
+                    return v.lower() not in ("false", "0", "off", "no", "")
+                return bool(v)
+        return False
+
+    if isinstance(value, list):
+        ids_to_check: set[str] = set()
+        if channel_id:
+            ids_to_check.add(str(channel_id))
+        if parent_id:
+            ids_to_check.add(str(parent_id))
+        for item in value:
+            if str(item) in ids_to_check:
+                return True
+        return False
+
+    if isinstance(value, str):
+        return value.lower() not in ("false", "0", "off", "no", "")
+
+    return bool(value)
+
+
 class BasePlatformAdapter(ABC):
     """
     Base class for platform adapters.

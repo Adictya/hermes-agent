@@ -1247,6 +1247,12 @@ DEFAULT_CONFIG = {
         "reactions": False,            # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
         "allowed_chats": "",           # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
+        "timestamp_context_chats": {}, # Per-chat/topic sent-time injection for LLM context (exact chat/topic IDs)
+    },
+
+    # Slack platform settings (gateway mode)
+    "slack": {
+        "channel_prompts": {},         # Per-channel ephemeral system prompts
     },
 
     # Mattermost platform settings (gateway mode)
