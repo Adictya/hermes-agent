@@ -345,6 +345,7 @@ class WeComAdapter(BasePlatformAdapter):
                 try:
                     await self._open_connection()
                     backoff_idx = 0
+                    self._mark_connected()
                     logger.info("[%s] Reconnected", self.name)
                 except Exception as reconnect_exc:
                     logger.warning("[%s] Reconnect failed: %s", self.name, reconnect_exc)
@@ -360,7 +361,7 @@ class WeComAdapter(BasePlatformAdapter):
                 payload = self._parse_json(msg.data)
                 if payload:
                     await self._dispatch_payload(payload)
-            elif msg.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR}:
+            elif msg.type in {aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSING}:
                 raise RuntimeError("WeCom websocket closed")
 
     async def _heartbeat_loop(self) -> None:

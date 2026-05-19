@@ -210,6 +210,19 @@ class TestFormatMessageBoldItalic:
         assert "*bold*" in result
         assert "_italic_" in result
 
+    def test_reload_mcp_summary_escapes_dynamic_server_names(self, adapter):
+        content = (
+            "🔄 **MCP Servers Reloaded**\n"
+            "♻️ Reconnected: agent_one, tool[beta]\n"
+            "➕ Added: alpha*prod\n"
+            "🔧 3 tool(s) available from 2 server(s)"
+        )
+        result = adapter.format_message(content)
+        assert "*MCP Servers Reloaded*" in result
+        assert "agent\\_one" in result
+        assert "tool\\[beta\\]" in result
+        assert "alpha\\*prod" in result
+
 
 # =========================================================================
 # format_message - headers
@@ -795,6 +808,33 @@ class TestEditMessageStreamingSafety:
         assert first_edit.kwargs["message_id"] == 456
         # Continuations were sent threaded as replies for visual grouping.
         assert adapter._bot.send_message.await_count == len(result.continuation_message_ids)
+
+    @pytest.mark.asyncio
+    async def test_message_too_long_continuations_preserve_topic_metadata(self):
+        """Overflow continuations should stay in the originating Telegram topic."""
+        adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+        adapter._bot = MagicMock()
+        adapter._bot.edit_message_text = AsyncMock()
+        sent_kwargs = []
+
+        async def _fake_send(**kwargs):
+            sent_kwargs.append(kwargs)
+            return SimpleNamespace(message_id=1000 + len(sent_kwargs))
+
+        adapter._bot.send_message = AsyncMock(side_effect=_fake_send)
+
+        result = await adapter.edit_message(
+            "-100123",
+            "456",
+            "x" * 6000,
+            finalize=False,
+            metadata={"thread_id": "17585"},
+        )
+
+        assert result.success is True
+        assert sent_kwargs, "expected at least one overflow continuation"
+        assert all(kwargs.get("message_thread_id") == 17585 for kwargs in sent_kwargs)
+        assert sent_kwargs[0]["reply_to_message_id"] == 456
 
 # =========================================================================
 # Telegram guest mention gating
