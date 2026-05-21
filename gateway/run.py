@@ -94,6 +94,7 @@ def _normalize_sent_at(value: Any, user_config: Optional[Dict[str, Any]] = None)
             dt = datetime.fromisoformat(text)
             if dt.tzinfo is not None:
                 return dt.astimezone(tz).isoformat()
+            return dt.replace(tzinfo=tz).isoformat()
         except Exception:
             pass
     return text

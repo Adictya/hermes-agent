@@ -101,6 +101,16 @@ def _make_source(chat_id="-1003961464202", thread_id=None) -> SessionSource:
     )
 
 
+def test_normalize_sent_at_attaches_configured_timezone_to_naive_string():
+    assert (
+        gateway_run._normalize_sent_at(
+            "2026-05-21T15:51:33",
+            user_config={"timezone": "Asia/Kolkata"},
+        )
+        == "2026-05-21T15:51:33+05:30"
+    )
+
+
 @pytest.mark.asyncio
 async def test_prepare_inbound_message_text_injects_timestamp_for_enabled_chat(monkeypatch):
     runner = _make_runner()
