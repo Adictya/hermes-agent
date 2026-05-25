@@ -151,6 +151,61 @@ def test_aiagent_reuses_existing_errors_log_handler():
             root_logger.addHandler(handler)
 
 
+def test_run_conversation_forwarder_accepts_persist_user_sent_at(monkeypatch):
+    import agent.conversation_loop as conversation_loop
+
+    captured = {}
+
+    def fake_run_conversation(
+        agent,
+        user_message,
+        system_message=None,
+        conversation_history=None,
+        task_id=None,
+        stream_callback=None,
+        persist_user_message=None,
+        persist_user_sent_at=None,
+    ):
+        captured.update(
+            {
+                "agent": agent,
+                "user_message": user_message,
+                "system_message": system_message,
+                "conversation_history": conversation_history,
+                "task_id": task_id,
+                "stream_callback": stream_callback,
+                "persist_user_message": persist_user_message,
+                "persist_user_sent_at": persist_user_sent_at,
+            }
+        )
+        return {"final_response": "ok"}
+
+    monkeypatch.setattr(conversation_loop, "run_conversation", fake_run_conversation)
+
+    agent = object.__new__(AIAgent)
+    history = [{"role": "user", "content": "previous"}]
+    result = agent.run_conversation(
+        "[Sent at: 2026-04-24T17:10:12+05:30]\n\ntoday was messy",
+        system_message="system",
+        conversation_history=history,
+        task_id="session-1",
+        persist_user_message="today was messy",
+        persist_user_sent_at="2026-04-24T17:10:12+05:30",
+    )
+
+    assert result == {"final_response": "ok"}
+    assert captured == {
+        "agent": agent,
+        "user_message": "[Sent at: 2026-04-24T17:10:12+05:30]\n\ntoday was messy",
+        "system_message": "system",
+        "conversation_history": history,
+        "task_id": "session-1",
+        "stream_callback": None,
+        "persist_user_message": "today was messy",
+        "persist_user_sent_at": "2026-04-24T17:10:12+05:30",
+    }
+
+
 class TestProviderModelNormalization:
     def test_aiagent_strips_matching_native_provider_prefix(self):
         with (
