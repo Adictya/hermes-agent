@@ -23,8 +23,13 @@ logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
-    """Return the current local time."""
-    return datetime.now()
+    """Return the current local time as a timezone-aware datetime."""
+    return datetime.now().astimezone()
+
+
+def _local_datetime(value: datetime) -> datetime:
+    """Normalize legacy naive datetimes to timezone-aware local time."""
+    return value.astimezone()
 
 
 # ---------------------------------------------------------------------------
@@ -543,15 +548,15 @@ class SessionEntry:
         _lrma = data.get("last_resume_marked_at")
         if _lrma:
             try:
-                last_resume_marked_at = datetime.fromisoformat(_lrma)
+                last_resume_marked_at = _local_datetime(datetime.fromisoformat(_lrma))
             except (TypeError, ValueError):
                 last_resume_marked_at = None
 
         return cls(
             session_key=data["session_key"],
             session_id=data["session_id"],
-            created_at=datetime.fromisoformat(data["created_at"]),
-            updated_at=datetime.fromisoformat(data["updated_at"]),
+            created_at=_local_datetime(datetime.fromisoformat(data["created_at"])),
+            updated_at=_local_datetime(datetime.fromisoformat(data["updated_at"])),
             origin=origin,
             display_name=data.get("display_name"),
             platform=platform,
@@ -760,18 +765,22 @@ class SessionStore:
             if self._has_active_processes_fn(entry.session_key):
                 return False
 
+        origin = entry.origin
         policy = self.config.get_reset_policy(
             platform=entry.platform,
             session_type=entry.chat_type,
+            chat_id=origin.chat_id if origin else None,
+            thread_id=origin.thread_id if origin else None,
         )
 
         if policy.mode == "none":
             return False
 
         now = _now()
+        updated_at = _local_datetime(entry.updated_at)
 
         if policy.mode in {"idle", "both"}:
-            idle_deadline = entry.updated_at + timedelta(minutes=policy.idle_minutes)
+            idle_deadline = updated_at + timedelta(minutes=policy.idle_minutes)
             if now > idle_deadline:
                 return True
 
@@ -782,7 +791,7 @@ class SessionStore:
             )
             if now.hour < policy.at_hour:
                 today_reset -= timedelta(days=1)
-            if entry.updated_at < today_reset:
+            if updated_at < today_reset:
                 return True
 
         return False
@@ -803,16 +812,19 @@ class SessionStore:
 
         policy = self.config.get_reset_policy(
             platform=source.platform,
-            session_type=source.chat_type
+            session_type=source.chat_type,
+            chat_id=source.chat_id,
+            thread_id=source.thread_id,
         )
         
         if policy.mode == "none":
             return None
         
         now = _now()
-        
+        updated_at = _local_datetime(entry.updated_at)
+
         if policy.mode in {"idle", "both"}:
-            idle_deadline = entry.updated_at + timedelta(minutes=policy.idle_minutes)
+            idle_deadline = updated_at + timedelta(minutes=policy.idle_minutes)
             if now > idle_deadline:
                 return "idle"
         
@@ -826,7 +838,7 @@ class SessionStore:
             if now.hour < policy.at_hour:
                 today_reset -= timedelta(days=1)
             
-            if entry.updated_at < today_reset:
+            if updated_at < today_reset:
                 return "daily"
         
         return None
@@ -1077,7 +1089,7 @@ class SessionStore:
                             "has_active_processes_fn raised during prune for %s: %s",
                             entry.session_key, exc,
                         )
-                if entry.updated_at < cutoff:
+                if _local_datetime(entry.updated_at) < cutoff:
                     removed_keys.append(key)
             for key in removed_keys:
                 self._entries.pop(key, None)
@@ -1118,7 +1130,7 @@ class SessionStore:
             for entry in self._entries.values():
                 if entry.resume_pending:
                     continue
-                if not entry.suspended and entry.updated_at >= cutoff:
+                if not entry.suspended and _local_datetime(entry.updated_at) >= cutoff:
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()
@@ -1242,9 +1254,9 @@ class SessionStore:
 
         if active_minutes is not None:
             cutoff = _now() - timedelta(minutes=active_minutes)
-            entries = [e for e in entries if e.updated_at >= cutoff]
+            entries = [e for e in entries if _local_datetime(e.updated_at) >= cutoff]
 
-        entries.sort(key=lambda e: e.updated_at, reverse=True)
+        entries.sort(key=lambda e: _local_datetime(e.updated_at), reverse=True)
 
         return entries
     

@@ -191,7 +191,7 @@ class TestSessionEntryResumeFields:
         assert entry.last_resume_marked_at is None
 
     def test_roundtrip_with_resume_fields(self):
-        now = datetime(2026, 4, 18, 12, 0, 0)
+        now = datetime(2026, 4, 18, 12, 0, 0).astimezone()
         entry = SessionEntry(
             session_key="agent:main:telegram:dm:1",
             session_id="sid",

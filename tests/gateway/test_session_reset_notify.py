@@ -25,11 +25,19 @@ from gateway.session import SessionEntry, SessionSource, SessionStore
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
+def _make_source(
+    platform=Platform.TELEGRAM,
+    chat_id="123",
+    user_id="u1",
+    chat_type="dm",
+    thread_id=None,
+):
     return SessionSource(
         platform=platform,
         chat_id=chat_id,
         user_id=user_id,
+        chat_type=chat_type,
+        thread_id=thread_id,
     )
 
 
@@ -59,6 +67,20 @@ class TestShouldResetReason:
         )
         source = _make_source()
         assert store._should_reset(entry, source) is None
+
+    def test_handles_legacy_naive_entry_with_timezone_aware_now(self, tmp_path):
+        store = _make_store(
+            SessionResetPolicy(mode="idle", idle_minutes=1),
+            tmp_path,
+        )
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime.now() - timedelta(hours=2),
+            updated_at=datetime.now() - timedelta(minutes=5),
+        )
+
+        assert store._should_reset(entry, _make_source()) == "idle"
 
     def test_returns_idle_when_idle_expired(self, tmp_path):
         store = _make_store(
@@ -164,6 +186,86 @@ class TestSessionEntryReason:
         entry2 = store.get_or_create_session(source)
         assert entry2.was_auto_reset is True
         assert entry2.reset_had_activity is True
+
+
+class TestChannelResetOverrides:
+    def test_should_reset_honors_thread_override(self, tmp_path):
+        source = _make_source(
+            chat_id="-100123",
+            chat_type="group",
+            thread_id="42",
+        )
+        config = GatewayConfig(
+            default_reset_policy=SessionResetPolicy(mode="idle", idle_minutes=1),
+            reset_by_channel=[
+                {
+                    "platform": "telegram",
+                    "chat_id": "-100123",
+                    "thread_id": "42",
+                    "policy": {"mode": "none"},
+                }
+            ],
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime.now() - timedelta(days=2),
+            updated_at=datetime.now() - timedelta(days=1),
+            origin=source,
+            platform=source.platform,
+            chat_type=source.chat_type,
+        )
+
+        assert store._should_reset(entry, source) is None
+
+    def test_is_session_expired_honors_origin_channel_override(self, tmp_path):
+        source = _make_source(
+            chat_id="-100123",
+            chat_type="group",
+            thread_id="42",
+        )
+        config = GatewayConfig(
+            default_reset_policy=SessionResetPolicy(mode="idle", idle_minutes=1),
+            reset_by_channel=[
+                {
+                    "platform": "telegram",
+                    "chat_id": "-100123",
+                    "thread_id": "42",
+                    "policy": {"mode": "none"},
+                }
+            ],
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime.now() - timedelta(days=2),
+            updated_at=datetime.now() - timedelta(days=1),
+            origin=source,
+            platform=source.platform,
+            chat_type=source.chat_type,
+        )
+
+        assert store._is_session_expired(entry) is False
+
+
+class TestSessionEntryTimezoneRoundtrip:
+    def test_from_dict_normalizes_legacy_naive_timestamps_to_aware(self):
+        data = {
+            "session_key": "test",
+            "session_id": "s1",
+            "created_at": "2026-05-01T10:00:00",
+            "updated_at": "2026-05-01T11:00:00",
+            "last_resume_marked_at": "2026-05-01T11:30:00",
+        }
+
+        entry = SessionEntry.from_dict(data)
+
+        assert entry.created_at.tzinfo is not None
+        assert entry.updated_at.tzinfo is not None
+        assert entry.last_resume_marked_at is not None
+        assert entry.last_resume_marked_at.tzinfo is not None
 
 
 # ---------------------------------------------------------------------------

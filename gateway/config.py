@@ -460,6 +460,9 @@ class GatewayConfig:
     default_reset_policy: SessionResetPolicy = field(default_factory=SessionResetPolicy)
     reset_by_type: Dict[str, SessionResetPolicy] = field(default_factory=dict)
     reset_by_platform: Dict[Platform, SessionResetPolicy] = field(default_factory=dict)
+    # Per-channel/topic overrides. Each item is a dict with platform, chat_id,
+    # optional thread_id, and a policy dict accepted by SessionResetPolicy.from_dict().
+    reset_by_channel: List[Dict[str, Any]] = field(default_factory=list)
     
     # Reset trigger commands
     reset_triggers: List[str] = field(default_factory=lambda: ["/new", "/reset"])
@@ -545,16 +548,40 @@ class GatewayConfig:
         return None
     
     def get_reset_policy(
-        self, 
+        self,
         platform: Optional[Platform] = None,
-        session_type: Optional[str] = None
+        session_type: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> SessionResetPolicy:
         """
         Get the appropriate reset policy for a session.
-        
-        Priority: platform override > type override > default
+
+        Priority: channel/topic override > platform override > type override > default
         """
-        # Platform-specific override takes precedence
+        if platform and chat_id:
+            platform_value = (
+                platform.value if isinstance(platform, Platform) else str(platform)
+            )
+            chat_value = str(chat_id)
+            thread_value = str(thread_id) if thread_id is not None else None
+            for override in self.reset_by_channel:
+                if not isinstance(override, dict):
+                    continue
+                if str(override.get("platform", "")) != platform_value:
+                    continue
+                if str(override.get("chat_id", "")) != chat_value:
+                    continue
+                override_thread = override.get("thread_id")
+                if override_thread is not None and str(override_thread) != (
+                    thread_value or ""
+                ):
+                    continue
+                policy_data = override.get("policy", override.get("reset_policy", {}))
+                if isinstance(policy_data, dict):
+                    return SessionResetPolicy.from_dict(policy_data)
+
+        # Platform-specific override
         if platform and platform in self.reset_by_platform:
             return self.reset_by_platform[platform]
         
@@ -576,6 +603,7 @@ class GatewayConfig:
             "reset_by_platform": {
                 p.value: v.to_dict() for p, v in self.reset_by_platform.items()
             },
+            "reset_by_channel": self.reset_by_channel,
             "reset_triggers": self.reset_triggers,
             "quick_commands": self.quick_commands,
             "sessions_dir": str(self.sessions_dir),
@@ -639,11 +667,16 @@ class GatewayConfig:
         except (TypeError, ValueError):
             session_store_max_age_days = 90
 
+        reset_by_channel = data.get("reset_by_channel", [])
+        if not isinstance(reset_by_channel, list):
+            reset_by_channel = []
+
         return cls(
             platforms=platforms,
             default_reset_policy=default_policy,
             reset_by_type=reset_by_type,
             reset_by_platform=reset_by_platform,
+            reset_by_channel=reset_by_channel,
             reset_triggers=data.get("reset_triggers", ["/new", "/reset"]),
             quick_commands=quick_commands,
             sessions_dir=sessions_dir,
@@ -719,6 +752,10 @@ def load_gateway_config() -> GatewayConfig:
             sr = yaml_cfg.get("session_reset")
             if sr and isinstance(sr, dict):
                 gw_data["default_reset_policy"] = sr
+
+            sro = yaml_cfg.get("session_reset_overrides")
+            if isinstance(sro, list):
+                gw_data["reset_by_channel"] = sro
 
             qc = yaml_cfg.get("quick_commands")
             if qc is not None:

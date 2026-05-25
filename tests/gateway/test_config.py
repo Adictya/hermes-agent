@@ -226,6 +226,53 @@ class TestGatewayConfigRoundtrip:
         assert restored.unauthorized_dm_behavior == "ignore"
         assert restored.platforms[Platform.WHATSAPP].extra["unauthorized_dm_behavior"] == "pair"
 
+    def test_roundtrip_preserves_reset_by_channel(self):
+        config = GatewayConfig(
+            reset_by_channel=[
+                {
+                    "platform": "telegram",
+                    "chat_id": "-100123",
+                    "thread_id": "42",
+                    "policy": {"mode": "none"},
+                }
+            ],
+        )
+
+        restored = GatewayConfig.from_dict(config.to_dict())
+
+        assert restored.reset_by_channel == config.reset_by_channel
+
+    def test_get_reset_policy_channel_override_precedes_platform_and_type(self):
+        config = GatewayConfig(
+            default_reset_policy=SessionResetPolicy(mode="both"),
+            reset_by_type={"group": SessionResetPolicy(mode="daily")},
+            reset_by_platform={Platform.TELEGRAM: SessionResetPolicy(mode="idle")},
+            reset_by_channel=[
+                {
+                    "platform": "telegram",
+                    "chat_id": "-100123",
+                    "thread_id": "42",
+                    "policy": {"mode": "none"},
+                }
+            ],
+        )
+
+        policy = config.get_reset_policy(
+            Platform.TELEGRAM,
+            "group",
+            chat_id="-100123",
+            thread_id="42",
+        )
+        fallback = config.get_reset_policy(
+            Platform.TELEGRAM,
+            "group",
+            chat_id="-100123",
+            thread_id="99",
+        )
+
+        assert policy.mode == "none"
+        assert fallback.mode == "idle"
+
     def test_from_dict_coerces_quoted_false_always_log_local(self):
         restored = GatewayConfig.from_dict({"always_log_local": "false"})
         assert restored.always_log_local is False
@@ -376,6 +423,42 @@ class TestLoadGatewayConfig:
         config = load_gateway_config()
 
         assert config.default_reset_policy.notify is False
+
+    def test_bridges_session_reset_overrides_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "session_reset_overrides:\n"
+            "  - platform: telegram\n"
+            "    chat_id: '-100123'\n"
+            "    thread_id: '42'\n"
+            "    policy:\n"
+            "      mode: none\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.reset_by_channel == [
+            {
+                "platform": "telegram",
+                "chat_id": "-100123",
+                "thread_id": "42",
+                "policy": {"mode": "none"},
+            }
+        ]
+        assert (
+            config.get_reset_policy(
+                Platform.TELEGRAM,
+                "group",
+                chat_id="-100123",
+                thread_id="42",
+            ).mode
+            == "none"
+        )
 
     def test_bridges_quoted_false_always_log_local_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
