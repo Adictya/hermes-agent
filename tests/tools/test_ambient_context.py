@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from hermes_constants import get_hermes_home
 from tools.ambient_context import (
     AmbientAnalysisIncompleteError,
     AmbientIngestValidationError,
@@ -12,6 +13,7 @@ from tools.ambient_context import (
     _analyze_screenshot,
     _ambient_analysis_looks_incomplete,
     _extract_images_from_content,
+    _normalize_ambient_activity_log,
     read_ambient_context_tool,
     store_ambient_ingest_events,
 )
@@ -82,6 +84,23 @@ def test_ambient_analysis_incomplete_detector():
     assert not _ambient_analysis_looks_incomplete(
         "Zen Browser is open on the Hermes dashboard. The page shows provider integrations."
     )
+
+
+def test_normalize_ambient_activity_log_preserves_long_fragment():
+    analysis = (
+        "Zen Browser is open on the Hermes dashboard. "
+        "The page shows provider integrations. "
+        "A terminal is visible in the second monitor. "
+        "The user appears to be reviewing configuration state. "
+        "Extra sentence that should not be stored. "
+        + "verbose details " * 200
+        + "cut off in the middle of"
+    )
+
+    normalized, reason = _normalize_ambient_activity_log(analysis)
+
+    assert reason is None
+    assert normalized == analysis
 
 
 @pytest.mark.asyncio
@@ -174,7 +193,7 @@ async def test_analyze_screenshot_requires_non_empty_final_analysis(monkeypatch,
 async def test_analyze_screenshot_retries_incomplete_final_analysis(monkeypatch, tmp_path):
     responses = iter(
         [
-            {"success": True, "analysis": "Zen Browser is open displaying the Hermes dashboard. The page shows Provider integrations"},
+            {"success": True, "analysis": "Provider integrations"},
             {"success": True, "analysis": "Zen Browser is open displaying the Hermes dashboard. The page shows provider integrations and configuration controls."},
         ]
     )
@@ -196,6 +215,55 @@ async def test_analyze_screenshot_retries_incomplete_final_analysis(monkeypatch,
     assert analysis.endswith("controls.")
     assert len(prompts) == 2
     assert "previous response was incomplete" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_analyze_screenshot_accepts_long_truncated_analysis(monkeypatch, tmp_path):
+    long_analysis = (
+        "Zen Browser is open on the Hermes dashboard. "
+        "The page shows provider integrations. "
+        "A terminal is visible in the second monitor. "
+        "The user appears to be reviewing configuration state. "
+        "Extra sentence that should not be stored. "
+        + "verbose details " * 500
+        + "cut off in the middle of"
+    )
+    prompts = []
+
+    async def _fake_vision_analyze_tool(**kwargs):
+        prompts.append(kwargs["user_prompt"])
+        assert "max_tokens" not in kwargs
+        return json.dumps(
+            {
+                "success": True,
+                "analysis": long_analysis,
+                "metadata": {
+                    "finish_reason": "length",
+                    "configured_provider": "opencode-go",
+                    "response_model": "kimi-k2.6",
+                    "max_tokens": 2000,
+                },
+            }
+        )
+
+    monkeypatch.setattr(
+        "tools.vision_tools.vision_analyze_tool",
+        _fake_vision_analyze_tool,
+    )
+    image_path = tmp_path / "screen.png"
+    image_path.write_bytes(b"not validated by patched vision tool")
+
+    analysis = await _analyze_screenshot(image_path, 1.0, "")
+
+    assert analysis == long_analysis
+    assert len(prompts) == 1
+    capture_path = get_hermes_home() / "logs" / "ambient_vision_captures.jsonl"
+    records = [json.loads(line) for line in capture_path.read_text().splitlines()]
+    assert records[-1]["event"] == "accepted_shape_warning"
+    assert records[-1]["reason"] == "missing_terminal_punctuation"
+    assert records[-1]["finish_reason"] == "length"
+    assert records[-1]["configured_provider"] == "opencode-go"
+    assert "cut off in the middle of" in records[-1]["analysis_tail"]
 
 
 @pytest.mark.asyncio

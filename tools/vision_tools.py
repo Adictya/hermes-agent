@@ -97,6 +97,31 @@ def _final_answer_retry_kwargs(call_kwargs: Dict[str, Any]) -> Dict[str, Any]:
     retry_kwargs["extra_body"] = extra_body
     return retry_kwargs
 
+
+def _vision_response_metadata(response: Any, **context: Any) -> Dict[str, Any]:
+    """Collect compact response metadata for downstream diagnostics."""
+    metadata = {k: v for k, v in context.items() if v not in (None, "")}
+    try:
+        choice = response.choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason is not None:
+            metadata["finish_reason"] = finish_reason
+    except Exception:
+        pass
+    response_model = getattr(response, "model", None)
+    if response_model:
+        metadata["response_model"] = response_model
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        usage_data = {}
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = getattr(usage, field, None)
+            if value is not None:
+                usage_data[field] = value
+        if usage_data:
+            metadata["usage"] = usage_data
+    return metadata
+
 # Configurable HTTP download timeout for _download_image().
 # Separate from auxiliary.vision.timeout which governs the LLM API call.
 # Resolution: config.yaml auxiliary.vision.download_timeout → env var → 30s default.
@@ -684,6 +709,7 @@ async def vision_analyze_tool(
     image_url: str,
     user_prompt: str,
     model: str = None,
+    max_tokens: int = None,
 ) -> str:
     """
     Analyze an image from a URL or local file path using vision AI.
@@ -723,7 +749,8 @@ async def vision_analyze_tool(
         "parameters": {
             "image_url": image_url,
             "user_prompt": user_prompt[:200] + "..." if len(user_prompt) > 200 else user_prompt,
-            "model": model
+            "model": model,
+            "max_tokens": max_tokens,
         },
         "error": None,
         "success": False,
@@ -834,10 +861,14 @@ async def vision_analyze_tool(
         # Local vision models (llama.cpp, ollama) can take well over 30s.
         vision_timeout = 120.0
         vision_temperature = 0.1
+        configured_provider = None
+        configured_model = None
         try:
             from hermes_cli.config import cfg_get, load_config
             _cfg = load_config()
             _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
+            configured_provider = str(_vision_cfg.get("provider") or "").strip() or None
+            configured_model = str(_vision_cfg.get("model") or "").strip() or None
             _vt = _vision_cfg.get("timeout")
             if _vt is not None:
                 vision_timeout = float(_vt)
@@ -850,7 +881,7 @@ async def vision_analyze_tool(
             "task": "vision",
             "messages": messages,
             "temperature": vision_temperature,
-            "max_tokens": 2000,
+            "max_tokens": max_tokens if max_tokens is not None else 2000,
             "timeout": vision_timeout,
         }
         if model:
@@ -873,6 +904,14 @@ async def vision_analyze_tool(
                 response = await async_call_llm(**call_kwargs)
             else:
                 raise
+        response_metadata = _vision_response_metadata(
+            response,
+            configured_provider=configured_provider,
+            configured_model=configured_model,
+            requested_model=model,
+            max_tokens=call_kwargs.get("max_tokens"),
+            timeout=vision_timeout,
+        )
         
         # Extract only final answer content. Reasoning traces are not suitable
         # for persisted screenshot activity logs.
@@ -882,6 +921,15 @@ async def vision_analyze_tool(
         if not analysis:
             logger.warning("Vision LLM returned empty content, retrying once without reasoning")
             response = await async_call_llm(**_final_answer_retry_kwargs(call_kwargs))
+            response_metadata = _vision_response_metadata(
+                response,
+                configured_provider=configured_provider,
+                configured_model=configured_model,
+                requested_model=model,
+                max_tokens=call_kwargs.get("max_tokens"),
+                timeout=vision_timeout,
+                retried_for_empty_content=True,
+            )
             analysis = _extract_final_content_only(response)
 
         if not analysis:
@@ -889,16 +937,23 @@ async def vision_analyze_tool(
 
         analysis_length = len(analysis)
         
-        logger.info("Image analysis completed (%s characters)", analysis_length)
+        logger.info(
+            "Image analysis completed (%s characters, finish_reason=%s, model=%s)",
+            analysis_length,
+            response_metadata.get("finish_reason"),
+            response_metadata.get("response_model") or response_metadata.get("configured_model"),
+        )
         
         # Prepare successful response
         result = {
             "success": True,
-            "analysis": analysis or "There was a problem with the request and the image could not be analyzed."
+            "analysis": analysis or "There was a problem with the request and the image could not be analyzed.",
+            "metadata": response_metadata,
         }
         
         debug_call_data["success"] = True
         debug_call_data["analysis_length"] = analysis_length
+        debug_call_data["response_metadata"] = response_metadata
         
         # Log debug information
         _debug.log_call("vision_analyze_tool", debug_call_data)

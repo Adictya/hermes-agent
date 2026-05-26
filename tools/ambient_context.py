@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 AMBIENT_DEFAULT_SESSION_ID = "ambient:journal:context"
 _CONTENT_JSON_PREFIX = "\x00json:"
+_AMBIENT_TERMINAL_PUNCTUATION = ".!?)]}'\""
+_AMBIENT_CAPTURE_TAIL_CHARS = 240
 
 
 class AmbientIngestValidationError(ValueError):
@@ -379,17 +381,79 @@ def _extract_images_from_content(
     return images
 
 
-def _ambient_analysis_looks_incomplete(analysis: str) -> bool:
-    """Detect final-answer fragments that should not be persisted."""
+def _ambient_analysis_incomplete_reason(analysis: str) -> Optional[str]:
+    """Return why final-answer text should not be persisted, if any."""
     text = analysis.strip()
     if not text:
-        return True
+        return "empty"
     if len(text) < 40:
-        return True
-    return text[-1] not in ".!?)]}'\""
+        return "under_40_chars"
+    if text[-1] not in _AMBIENT_TERMINAL_PUNCTUATION:
+        return "missing_terminal_punctuation"
+    return None
 
 
-async def _call_vision_for_activity_log(image_path: Path, prompt: str) -> str:
+def _ambient_analysis_looks_incomplete(analysis: str) -> bool:
+    """Detect final-answer fragments that should not be persisted."""
+    return _ambient_analysis_incomplete_reason(analysis) is not None
+
+
+def _compact_ambient_analysis(analysis: str) -> str:
+    return str(analysis or "").strip()
+
+
+def _normalize_ambient_activity_log(analysis: str) -> tuple[str, Optional[str]]:
+    """Preserve model detail while removing only surrounding whitespace."""
+    return _compact_ambient_analysis(analysis), None
+
+
+def _ambient_analysis_should_accept_shape(reason: str, analysis: str) -> bool:
+    """Accept detailed output even when the terminal-punctuation heuristic complains."""
+    return reason == "missing_terminal_punctuation" and len(analysis.strip()) >= 40
+
+
+def _ambient_analysis_tail(analysis: str, limit: int = _AMBIENT_CAPTURE_TAIL_CHARS) -> str:
+    text = str(analysis or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def _record_ambient_vision_capture(
+    *,
+    event: str,
+    attempt: int,
+    reason: str,
+    analysis: str,
+    normalized_analysis: str,
+    metadata: Dict[str, Any],
+) -> None:
+    """Append a compact local capture for diagnosing ambient vision drops."""
+    try:
+        path = get_hermes_home() / "logs" / "ambient_vision_captures.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            "attempt": attempt,
+            "reason": reason,
+            "analysis_length": len(str(analysis or "")),
+            "normalized_length": len(str(normalized_analysis or "")),
+            "analysis_tail": _ambient_analysis_tail(analysis),
+            "normalized_tail": _ambient_analysis_tail(normalized_analysis),
+            "finish_reason": metadata.get("finish_reason"),
+            "response_model": metadata.get("response_model"),
+            "configured_provider": metadata.get("configured_provider"),
+            "configured_model": metadata.get("configured_model"),
+            "max_tokens": metadata.get("max_tokens"),
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.debug("Failed to write ambient vision capture", exc_info=True)
+
+
+async def _call_vision_for_activity_log(image_path: Path, prompt: str, *, attempt: int = 1) -> str:
     from tools.vision_tools import vision_analyze_tool
 
     result_json = await vision_analyze_tool(
@@ -413,11 +477,57 @@ async def _call_vision_for_activity_log(image_path: Path, prompt: str) -> str:
     analysis = str(result.get("analysis") or "").strip()
     if not analysis:
         raise RuntimeError("Vision analysis returned no final content")
-    if _ambient_analysis_looks_incomplete(analysis):
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    normalized_analysis, _repair_reason = _normalize_ambient_activity_log(analysis)
+
+    incomplete_reason = _ambient_analysis_incomplete_reason(normalized_analysis)
+    if incomplete_reason and _ambient_analysis_should_accept_shape(incomplete_reason, normalized_analysis):
+        _record_ambient_vision_capture(
+            event="accepted_shape_warning",
+            attempt=attempt,
+            reason=incomplete_reason,
+            analysis=analysis,
+            normalized_analysis=normalized_analysis,
+            metadata=metadata,
+        )
+        logger.warning(
+            "Ambient vision analysis accepted despite shape warning: attempt=%s reason=%s length=%s normalized_length=%s "
+            "finish_reason=%s provider=%s model=%s tail=%r",
+            attempt,
+            incomplete_reason,
+            len(analysis),
+            len(normalized_analysis),
+            metadata.get("finish_reason"),
+            metadata.get("configured_provider"),
+            metadata.get("response_model") or metadata.get("configured_model"),
+            _ambient_analysis_tail(analysis),
+        )
+        return normalized_analysis
+
+    if incomplete_reason:
+        _record_ambient_vision_capture(
+            event="incomplete",
+            attempt=attempt,
+            reason=incomplete_reason,
+            analysis=analysis,
+            normalized_analysis=normalized_analysis,
+            metadata=metadata,
+        )
+        logger.warning(
+            "Ambient vision analysis incomplete: attempt=%s reason=%s length=%s finish_reason=%s "
+            "provider=%s model=%s tail=%r",
+            attempt,
+            incomplete_reason,
+            len(analysis),
+            metadata.get("finish_reason"),
+            metadata.get("configured_provider"),
+            metadata.get("response_model") or metadata.get("configured_model"),
+            _ambient_analysis_tail(analysis),
+        )
         raise AmbientAnalysisIncompleteError(
             "Vision analysis returned an incomplete final content fragment"
         )
-    return analysis
+    return normalized_analysis
 
 
 async def _analyze_screenshot(
@@ -432,7 +542,7 @@ async def _analyze_screenshot(
     prompt = (
         "This is a screenshot captured from Aditya's laptop. "
         f"It was taken at {time_str}.\n\n"
-        "Your job is to produce a definitive, concise activity log entry describing "
+        "Your job is to produce a definitive, detailed activity log entry describing "
         "EXACTLY what Aditya was doing at that moment.\n\n"
         "Instructions:\n"
         "1. Identify the primary active application, window, browser tab, or game.\n"
@@ -443,21 +553,23 @@ async def _analyze_screenshot(
         "6. Mention if this appears to be a dual-monitor setup or single screen.\n"
         "7. Include visible text that clarifies the activity, such as an email subject, PR title, or error.\n"
         "8. Be specific and factual; avoid assumptions about intent.\n\n"
-        "Write 2-4 complete sentences. End the final sentence with punctuation. "
+        "Write a detailed factual description with as much relevant visible detail as needed. "
+        "Include visible text that clarifies the activity, especially filenames, errors, titles, "
+        "messages, and UI labels. End the final sentence with punctuation if possible. "
         "Return only the final activity log entry; do not return hidden reasoning or a partial fragment.\n\n"
         "If the screen is mostly idle, such as desktop, wallpaper, or lock screen, state that clearly.\n\n"
         f"Additional metadata sent with the screenshot:\n{content_text or '(none)'}"
     )
 
     try:
-        return await _call_vision_for_activity_log(image_path, prompt)
+        return await _call_vision_for_activity_log(image_path, prompt, attempt=1)
     except AmbientAnalysisIncompleteError:
         retry_prompt = (
             f"{prompt}\n\n"
             "The previous response was incomplete. Retry with a complete, self-contained "
-            "2-4 sentence activity log entry ending in punctuation."
+            "activity log entry preserving the important visible details and ending in punctuation."
         )
-        return await _call_vision_for_activity_log(image_path, retry_prompt)
+        return await _call_vision_for_activity_log(image_path, retry_prompt, attempt=2)
 
 
 async def _analyze_image_payload(image: Dict[str, Any]) -> str:
