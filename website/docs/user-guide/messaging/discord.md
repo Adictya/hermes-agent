@@ -316,6 +316,7 @@ discord:
   history_backfill: true          # Prepend recent channel scrollback on mention (default: true)
   history_backfill_limit: 50      # Max messages to scan backwards (default: 50)
   channel_prompts: {}             # Per-channel ephemeral system prompts
+  timestamp_context_chats: {}     # Per-channel/thread sent-time context
   allow_mentions:                 # What the bot is allowed to ping (safe defaults)
     everyone: false               # @everyone / @here pings (default: false)
     roles: false                  # @role pings (default: false)
@@ -442,6 +443,20 @@ Behavior:
 - Exact thread/channel ID matches win.
 - If a message arrives inside a thread or forum post and that thread has no explicit entry, Hermes falls back to the parent channel/forum ID.
 - Prompts are applied ephemerally at runtime, so changing them affects future turns immediately without rewriting past session history.
+
+#### `discord.timestamp_context_chats`
+
+**Type:** mapping, list, or boolean — **Default:** `{}`
+
+Opt-in channel/thread IDs where Hermes prepends the original Discord message time to the LLM-visible user turn as `[Sent at: ...]`. The clean user message is still what gets persisted; the timestamp is stored separately and replayed on later turns.
+
+```yaml
+discord:
+  timestamp_context_chats:
+    "1234567890": true
+```
+
+Exact thread/channel ID matches win. If a message arrives inside a thread and the thread has no explicit entry, Hermes falls back to the parent channel ID.
 
 #### `discord.history_backfill`
 
@@ -797,5 +812,4 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
 

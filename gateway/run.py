@@ -7568,18 +7568,24 @@ class GatewayRunner:
 
     def _is_timestamp_context_enabled(self, source: SessionSource, user_config: Optional[Dict[str, Any]] = None) -> bool:
         """Return whether sent-time context should be injected for this source."""
-        if source.platform != Platform.TELEGRAM:
+        if source.platform not in {Platform.TELEGRAM, Platform.DISCORD}:
             return False
         user_config = user_config if user_config is not None else _load_gateway_config()
-        platform_cfg = user_config.get("telegram", {}) if isinstance(user_config, dict) else {}
+        platform_cfg = user_config.get(source.platform.value, {}) if isinstance(user_config, dict) else {}
         if not isinstance(platform_cfg, dict):
             return False
         from gateway.platforms.base import resolve_channel_flag
+        channel_id = str(source.thread_id) if source.thread_id else str(source.chat_id)
+        parent_id = None
+        if source.parent_chat_id:
+            parent_id = str(source.parent_chat_id)
+        elif source.thread_id and str(source.thread_id) != str(source.chat_id):
+            parent_id = str(source.chat_id)
         return resolve_channel_flag(
             platform_cfg,
             "timestamp_context_chats",
-            str(source.thread_id) if source.thread_id else str(source.chat_id),
-            str(source.chat_id) if source.thread_id else None,
+            channel_id,
+            parent_id,
         )
 
     async def _prepare_inbound_message_text(

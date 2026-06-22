@@ -90,14 +90,21 @@ def _make_runner():
     return runner
 
 
-def _make_source(chat_id="-1003961464202", thread_id=None) -> SessionSource:
+def _make_source(
+    chat_id="-1003961464202",
+    thread_id=None,
+    platform=Platform.TELEGRAM,
+    chat_type="group",
+    parent_chat_id=None,
+) -> SessionSource:
     return SessionSource(
-        platform=Platform.TELEGRAM,
+        platform=platform,
         chat_id=chat_id,
-        chat_type="group",
+        chat_type=chat_type,
         user_id="806682516",
         user_name="Aditya",
         thread_id=thread_id,
+        parent_chat_id=parent_chat_id,
     )
 
 
@@ -187,7 +194,91 @@ async def test_prepare_inbound_message_text_skips_timestamp_for_false_string_fla
 
 
 @pytest.mark.asyncio
-async def test_run_agent_replays_sent_at_history_and_persists_clean_user_message(monkeypatch, tmp_path):
+async def test_prepare_inbound_message_text_injects_timestamp_for_enabled_discord_channel(monkeypatch):
+    runner = _make_runner()
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "discord": {"timestamp_context_chats": {"1234567890": True}},
+            "timezone": "Asia/Kolkata",
+        },
+    )
+
+    event = MessageEvent(
+        text="today was messy",
+        source=_make_source(chat_id="1234567890", platform=Platform.DISCORD),
+        timestamp=datetime(2026, 4, 24, 11, 40, 12, tzinfo=timezone.utc),
+    )
+
+    message = await runner._prepare_inbound_message_text(
+        event=event,
+        source=event.source,
+        history=[],
+    )
+
+    assert message == "[Sent at: 2026-04-24T17:10:12+05:30]\n\ntoday was messy"
+
+
+@pytest.mark.asyncio
+async def test_prepare_inbound_message_text_injects_timestamp_for_discord_thread_parent(monkeypatch):
+    runner = _make_runner()
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "discord": {"timestamp_context_chats": {"1234567890": True}},
+            "timezone": "Asia/Kolkata",
+        },
+    )
+
+    event = MessageEvent(
+        text="today was messy",
+        source=_make_source(
+            chat_id="2222222222",
+            thread_id="2222222222",
+            parent_chat_id="1234567890",
+            platform=Platform.DISCORD,
+            chat_type="thread",
+        ),
+        timestamp=datetime(2026, 4, 24, 11, 40, 12, tzinfo=timezone.utc),
+    )
+
+    message = await runner._prepare_inbound_message_text(
+        event=event,
+        source=event.source,
+        history=[],
+    )
+
+    assert message == "[Sent at: 2026-04-24T17:10:12+05:30]\n\n[Aditya] today was messy"
+
+
+@pytest.mark.parametrize(
+    ("source", "platform_key", "enabled_id", "session_key"),
+    [
+        (
+            _make_source(),
+            "telegram",
+            "-1003961464202",
+            "telegram:group:-1003961464202",
+        ),
+        (
+            _make_source(chat_id="1234567890", platform=Platform.DISCORD),
+            "discord",
+            "1234567890",
+            "discord:group:1234567890",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_agent_replays_sent_at_history_and_persists_clean_user_message(
+    monkeypatch,
+    tmp_path,
+    source,
+    platform_key,
+    enabled_id,
+    session_key,
+):
     _install_fake_agent(monkeypatch)
     runner = _make_runner()
 
@@ -199,7 +290,7 @@ async def test_run_agent_replays_sent_at_history_and_persists_clean_user_message
         gateway_run,
         "_load_gateway_config",
         lambda: {
-            "telegram": {"timestamp_context_chats": {"-1003961464202": True}},
+            platform_key: {"timestamp_context_chats": {enabled_id: True}},
             "display": {},
             "agent": {"system_prompt": "Global prompt"},
             "timezone": "Asia/Kolkata",
@@ -232,9 +323,9 @@ async def test_run_agent_replays_sent_at_history_and_persists_clean_user_message
                 "sent_at": "2026-04-23T03:45:00+00:00",
             }
         ],
-        source=_make_source(),
+        source=source,
         session_id="session-1",
-        session_key="telegram:group:-1003961464202",
+        session_key=session_key,
         channel_prompt=None,
         persist_user_message="today was messy",
         persist_user_sent_at="2026-04-24T17:10:12+05:30",
